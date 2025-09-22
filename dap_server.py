@@ -136,13 +136,15 @@ class SocketDAPServer:
         self.socket.settimeout(1.0)  # Add timeout for accept()
         
         # Bind to localhost with automatic port selection if port=0
+        # TODO: for testing, just use 13000 like lldb does
+        self.port = 13000
         self.socket.bind(('localhost', self.port))
         actual_port = self.socket.getsockname()[1]
         self.port = actual_port
-        
+
         self.socket.listen(1)
         logger.info(f"Socket DAP Server listening on port {self.port}")
-        
+
         # Write port to file for client to read
         port_file = os.path.join(os.path.dirname(__file__), 'dap_server_port.txt')
         try:
@@ -151,11 +153,11 @@ class SocketDAPServer:
             logger.info(f"Port written to {port_file}")
         except Exception as e:
             logger.error(f"Failed to write port file: {e}")
-        
+
         # Also print to stdout (with flush)
         print(f"DAP Server listening on port {self.port}")
         sys.stdout.flush()
-        
+
         return actual_port
 
     def wait_for_connection(self):
@@ -173,7 +175,7 @@ class SocketDAPServer:
             except Exception as e:
                 logger.error(f"Error accepting connection: {e}")
                 return False
-        
+
         return False
 
     def get_next_seq(self) -> int:
@@ -252,13 +254,270 @@ class SocketDAPServer:
                 logger.error(f"Error stopping debugger: {e}")
         self.send_response(request['seq'], 'disconnect')
 
+    def handle_launch(self, request: Dict[str, Any]):
+        """Handle launch request"""
+        logger.info("Handling launch request")
+        args = request.get('arguments', {})
+        program = args.get('program')
+
+        if not program:
+            self.send_response(request['seq'], 'launch', False, 'No program specified')
+            return
+
+        try:
+            success = self.debugger.start(
+                program=program,
+                args=args.get('args', []),
+                cwd=args.get('cwd')
+            )
+
+            if success:
+                self.is_running = True
+                self.send_response(request['seq'], 'launch')
+                if args.get('stopOnEntry', False):
+                    self.send_event('stopped', {
+                        'reason': 'entry',
+                        'threadId': 1
+                    })
+                else:
+                    self.debugger.continue_execution()
+            else:
+                self.send_response(request['seq'], 'launch', False, 'Failed to start debugger')
+        except Exception as e:
+            logger.error(f"Error in handle_launch: {e}")
+            self.send_response(request['seq'], 'launch', False, str(e))
+
+    def handle_set_breakpoints(self, request: Dict[str, Any]):
+        """Handle setBreakpoints request"""
+        logger.info("Handling setBreakpoints request")
+        args = request.get('arguments', {})
+        source = args.get('source', {})
+        file_path = source.get('path')
+        breakpoints = args.get('breakpoints', [])
+
+        if not file_path:
+            self.send_response(request['seq'], 'setBreakpoints', False, 'No file path provided')
+            return
+
+        try:
+            result_breakpoints = []
+            for bp in breakpoints:
+                line = bp.get('line')
+                if line:
+                    try:
+                        bp_id = self.debugger.set_breakpoint(file_path, line)
+                        result_breakpoints.append(Breakpoint(
+                            id=bp_id,
+                            verified=True,
+                            line=line,
+                            source=Source(path=file_path, name=os.path.basename(file_path))
+                        ))
+                    except Exception as e:
+                        logger.error(f"Failed to set breakpoint at {file_path}:{line}: {e}")
+                        result_breakpoints.append(Breakpoint(
+                            id=0,
+                            verified=False,
+                            line=line,
+                            source=Source(path=file_path, name=os.path.basename(file_path)),
+                            message=str(e)
+                        ))
+
+            self.send_response(request['seq'], 'setBreakpoints', body={
+                'breakpoints': [asdict(bp) for bp in result_breakpoints]
+            })
+        except Exception as e:
+            logger.error(f"Error in handle_set_breakpoints: {e}")
+            self.send_response(request['seq'], 'setBreakpoints', False, str(e))
+
+    def handle_configuration_done(self, request: Dict[str, Any]):
+        """Handle configurationDone request"""
+        logger.info("Handling configurationDone request")
+        self.send_response(request['seq'], 'configurationDone')
+
+    def handle_continue(self, request: Dict[str, Any]):
+        """Handle continue request"""
+        logger.info("Handling continue request")
+        try:
+            self.debugger.continue_execution()
+            self.send_response(request['seq'], 'continue', body={'allThreadsContinued': True})
+        except Exception as e:
+            logger.error(f"Error in handle_continue: {e}")
+            self.send_response(request['seq'], 'continue', False, str(e))
+
+    def handle_next(self, request: Dict[str, Any]):
+        """Handle next (step over) request"""
+        logger.info("Handling next request")
+        try:
+            self.debugger.step_over()
+            self.send_response(request['seq'], 'next')
+        except Exception as e:
+            logger.error(f"Error in handle_next: {e}")
+            self.send_response(request['seq'], 'next', False, str(e))
+
+    def handle_step_in(self, request: Dict[str, Any]):
+        """Handle stepIn request"""
+        logger.info("Handling stepIn request")
+        try:
+            self.debugger.step_into()
+            self.send_response(request['seq'], 'stepIn')
+        except Exception as e:
+            logger.error(f"Error in handle_step_in: {e}")
+            self.send_response(request['seq'], 'stepIn', False, str(e))
+
+    def handle_step_out(self, request: Dict[str, Any]):
+        """Handle stepOut request"""
+        logger.info("Handling stepOut request")
+        try:
+            self.debugger.step_out()
+            self.send_response(request['seq'], 'stepOut')
+        except Exception as e:
+            logger.error(f"Error in handle_step_out: {e}")
+            self.send_response(request['seq'], 'stepOut', False, str(e))
+
+    def handle_pause(self, request: Dict[str, Any]):
+        """Handle pause request"""
+        logger.info("Handling pause request")
+        try:
+            self.debugger.pause()
+            self.send_response(request['seq'], 'pause')
+        except Exception as e:
+            logger.error(f"Error in handle_pause: {e}")
+            self.send_response(request['seq'], 'pause', False, str(e))
+
+    def handle_threads(self, request: Dict[str, Any]):
+        """Handle threads request"""
+        logger.info("Handling threads request")
+        try:
+            threads = self.debugger.get_threads()
+            thread_list = [Thread(id=t.id, name=t.name) for t in threads]
+            self.send_response(request['seq'], 'threads', body={
+                'threads': [asdict(t) for t in thread_list]
+            })
+        except Exception as e:
+            logger.error(f"Error getting threads: {e}")
+            self.send_response(request['seq'], 'threads', body={
+                'threads': [asdict(Thread(id=1, name='Main Thread'))]
+            })
+
+    def handle_stack_trace(self, request: Dict[str, Any]):
+        """Handle stackTrace request"""
+        logger.info("Handling stackTrace request")
+        args = request.get('arguments', {})
+        thread_id = args.get('threadId', 1)
+
+        try:
+            frames = self.debugger.get_stack_trace(thread_id)
+            stack_frames = []
+            for i, frame in enumerate(frames):
+                stack_frames.append(StackFrame(
+                    id=i,
+                    name=frame.name,
+                    line=frame.line,
+                    column=0,
+                    source=Source(
+                        path=frame.file,
+                        name=os.path.basename(frame.file) if frame.file else None
+                    ) if frame.file else None
+                ))
+
+            self.send_response(request['seq'], 'stackTrace', body={
+                'stackFrames': [asdict(f) for f in stack_frames]
+            })
+        except Exception as e:
+            logger.error(f"Error getting stack trace: {e}")
+            self.send_response(request['seq'], 'stackTrace', False, str(e))
+
+    def handle_scopes(self, request: Dict[str, Any]):
+        """Handle scopes request"""
+        logger.info("Handling scopes request")
+        args = request.get('arguments', {})
+        frame_id = args.get('frameId', 0)
+
+        scopes = [
+            {'name': 'Locals', 'variablesReference': 1000 + frame_id, 'expensive': False},
+            {'name': 'Arguments', 'variablesReference': 2000 + frame_id, 'expensive': False}
+        ]
+
+        self.send_response(request['seq'], 'scopes', body={'scopes': scopes})
+
+    def handle_variables(self, request: Dict[str, Any]):
+        """Handle variables request"""
+        logger.info("Handling variables request")
+        args = request.get('arguments', {})
+        var_ref = args.get('variablesReference', 0)
+
+        try:
+            if var_ref >= 1000 and var_ref < 2000:
+                frame_id = var_ref - 1000
+                variables = self.debugger.get_local_variables(frame_id)
+            elif var_ref >= 2000:
+                frame_id = var_ref - 2000
+                variables = self.debugger.get_arguments(frame_id)
+            else:
+                variables = []
+
+            var_list = []
+            for var in variables:
+                var_list.append(Variable(
+                    name=var.name,
+                    value=var.value,
+                    type=var.type,
+                    variablesReference=0
+                ))
+
+            self.send_response(request['seq'], 'variables', body={
+                'variables': [asdict(v) for v in var_list]
+            })
+        except Exception as e:
+            logger.error(f"Error getting variables: {e}")
+            self.send_response(request['seq'], 'variables', body={'variables': []})
+
+    def handle_evaluate(self, request: Dict[str, Any]):
+        """Handle evaluate request"""
+        logger.info("Handling evaluate request")
+        args = request.get('arguments', {})
+        expression = args.get('expression', '')
+
+        try:
+            result = self.debugger.evaluate_expression(expression)
+            self.send_response(request['seq'], 'evaluate', body={
+                'result': str(result),
+                'variablesReference': 0
+            })
+        except Exception as e:
+            logger.error(f"Error evaluating expression: {e}")
+            self.send_response(request['seq'], 'evaluate', False, str(e))
+
+    def handle_set_exception_breakpoints(self, request: Dict[str, Any]):
+        """Handle setExceptionBreakpoints request (no-op)"""
+        logger.info("Handling setExceptionBreakpoints request")
+        # You can implement real exception breakpoints if your debugger supports it.
+        # For now, just respond with an empty list.
+        self.send_response(request['seq'], 'setExceptionBreakpoints', body={
+            'breakpoints': []
+        })
+
     def run(self):
         """Main message loop using socket"""
         logger.info("Starting Socket DAP Server message loop...")
 
         handlers = {
             'initialize': self.handle_initialize,
+            'launch': self.handle_launch,
+            'setBreakpoints': self.handle_set_breakpoints,
+            'configurationDone': self.handle_configuration_done,
+            'continue': self.handle_continue,
+            'next': self.handle_next,
+            'stepIn': self.handle_step_in,
+            'stepOut': self.handle_step_out,
+            'pause': self.handle_pause,
+            'threads': self.handle_threads,
+            'stackTrace': self.handle_stack_trace,
+            'scopes': self.handle_scopes,
+            'variables': self.handle_variables,
+            'evaluate': self.handle_evaluate,
             'disconnect': self.handle_disconnect,
+            'setExceptionBreakpoints': self.handle_set_exception_breakpoints,
         }
 
         buffer = b""
@@ -266,7 +525,7 @@ class SocketDAPServer:
         try:
             logger.info("Reading from socket...")
             self.client_socket.settimeout(1.0)  # Add timeout for recv()
-            
+
             while self.running:
                 try:
                     # Read data from socket
@@ -274,46 +533,46 @@ class SocketDAPServer:
                     if not data:
                         logger.info("Client disconnected")
                         break
-                    
+
                     buffer += data
                     logger.debug(f"Received {len(data)} bytes, buffer now {len(buffer)} bytes")
-                    
+
                     # Process complete messages in buffer
                     while True:
                         # Look for Content-Length header
                         if b'Content-Length:' not in buffer:
                             break
-                        
+
                         # Find header end
                         header_end = buffer.find(b'\r\n\r\n')
                         if header_end == -1:
                             break
-                        
+
                         # Parse headers
                         header_text = buffer[:header_end].decode('utf-8')
                         content_start = header_end + 4
-                        
+
                         content_length = 0
                         for line in header_text.split('\r\n'):
                             if line.startswith('Content-Length:'):
                                 content_length = int(line.split(':', 1)[1].strip())
                                 break
-                        
+
                         logger.debug(f"Parsed Content-Length: {content_length}")
-                        
+
                         # Check if we have complete message
                         if len(buffer) < content_start + content_length:
                             logger.debug(f"Need more data: have {len(buffer)}, need {content_start + content_length}")
                             break
-                        
+
                         # Extract content
                         content_bytes = buffer[content_start:content_start + content_length]
                         content = content_bytes.decode('utf-8')
                         logger.debug(f"Extracted content: {repr(content)}")
-                        
+
                         # Remove processed message from buffer
                         buffer = buffer[content_start + content_length:]
-                        
+
                         # Parse and handle JSON
                         try:
                             request = json.loads(content)
@@ -361,7 +620,7 @@ class SocketDAPServer:
             self.client_socket.close()
         if self.socket:
             self.socket.close()
-        
+
         # Clean up port file
         port_file = os.path.join(os.path.dirname(__file__), 'dap_server_port.txt')
         try:
@@ -369,21 +628,23 @@ class SocketDAPServer:
                 os.remove(port_file)
         except:
             pass
-        
+
         logger.info("Socket DAP Server stopped")
+
 
 def signal_handler(signum, frame):
     """Handle SIGINT (Ctrl+C)"""
     print("\nReceived interrupt signal, shutting down...")
     sys.exit(0)
 
+
 def main():
     """Main entry point"""
     # Set up signal handler for Ctrl+C
     signal.signal(signal.SIGINT, signal_handler)
-    
+
     server = SocketDAPServer()
-    
+
     try:
         port = server.start_server()
         if server.wait_for_connection():
@@ -396,6 +657,7 @@ def main():
         logger.error(traceback.format_exc())
     finally:
         server.cleanup()
+
 
 if __name__ == '__main__':
     main()
