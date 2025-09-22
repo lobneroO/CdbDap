@@ -8,3 +8,5 @@ env/
 .vscode/
 
 vc140.pdb
+
+socket_dap_debug.log

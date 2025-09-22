@@ -261,28 +261,34 @@ class SocketDAPServer:
         program = args.get('program')
 
         if not program:
-            self.send_response(request['seq'], 'launch', False, 'No program specified')
+            self.send_response(request['seq'], 'launch',
+                               False, 'No program specified')
             return
 
         try:
+            entry_func = args.get('entryFunction', 'main')
+            self.debugger.set_breakpoint(program, entry_func)
+
             success = self.debugger.start(
                 program=program,
                 args=args.get('args', []),
-                cwd=args.get('cwd')
+                cwd=args.get('cwd'),
             )
 
             if success:
                 self.is_running = True
                 self.send_response(request['seq'], 'launch')
-                if args.get('stopOnEntry', False):
-                    self.send_event('stopped', {
-                        'reason': 'entry',
-                        'threadId': 1
-                    })
-                else:
-                    self.debugger.continue_execution()
+                # if args.get('stopOnEntry', False):
+                self.send_event('stopped', {
+                    'reason': 'entry',
+                    'threadId': 1,
+                    'allThreadsStopped': True
+                })
+                # else:
+                #     self.debugger.continue_execution()
             else:
-                self.send_response(request['seq'], 'launch', False, 'Failed to start debugger')
+                self.send_response(request['seq'], 'launch',
+                                   False, 'Failed to start debugger')
         except Exception as e:
             logger.error(f"Error in handle_launch: {e}")
             self.send_response(request['seq'], 'launch', False, str(e))
@@ -385,11 +391,12 @@ class SocketDAPServer:
             self.send_response(request['seq'], 'pause', False, str(e))
 
     def handle_threads(self, request: Dict[str, Any]):
-        """Handle threads request"""
         logger.info("Handling threads request")
         try:
             threads = self.debugger.get_threads()
             thread_list = [Thread(id=t.id, name=t.name) for t in threads]
+            if not thread_list:
+                thread_list = [Thread(id=1, name='Main Thread')]
             self.send_response(request['seq'], 'threads', body={
                 'threads': [asdict(t) for t in thread_list]
             })

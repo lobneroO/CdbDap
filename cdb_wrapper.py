@@ -162,7 +162,8 @@ class CdbCommunicator:
                       cwd: str = None) -> bool:
         """Start CDB process"""
         try:
-            cdb_command = ['cdb.exe', '-g', '-G', '-cf', '-cfr']
+            # cdb_command = ['cdb.exe', '-g', '-G', '-cf', '-cfr']
+            cdb_command = ['cdb.exe', '-G', '-cf', '-cfr']
             cdb_command.append(program)
             if args:
                 cdb_command.extend(args)
