@@ -1,0 +1,10 @@
+__pycache__/
+
+test_program/build/
+
+env/
+
+.vs/
+.vscode/
+
+vc140.pdb

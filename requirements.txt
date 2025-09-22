@@ -1,0 +1,12 @@
+# Debug Adapter Protocol server dependencies
+# Core Python standard library modules are used, no external dependencies required
+
+# Optional dependencies for enhanced functionality:
+# psutil>=5.8.0          # For process management and system info
+# pywin32>=227           # For Windows-specific functionality (if needed)
+
+# Development dependencies:
+# pytest>=6.0.0          # For unit testing
+# black>=21.0.0          # Code formatting
+# flake8>=3.8.0          # Code linting
+# mypy>=0.812            # Type checking

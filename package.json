@@ -1,0 +1,115 @@
+{
+    "name": "cdb-dap",
+    "displayName": "CDB Debug Adapter",
+    "version": "1.0.0",
+    "description": "Debug Adapter Protocol implementation for C++ using Windows CDB",
+    "author": "DAP Implementation",
+    "license": "MIT",
+    "engines": {
+        "vscode": "^1.60.0"
+    },
+    "categories": ["Debuggers"],
+    "keywords": ["debug", "debugger", "c++", "cpp", "cdb", "windows"],
+    "contributes": {
+        "debuggers": [
+            {
+                "type": "cdb-cpp",
+                "label": "CDB C++ Debugger",
+                "program": "./dap_server.py",
+                "runtime": "python",
+                "configurationAttributes": {
+                    "launch": {
+                        "required": ["program"],
+                        "properties": {
+                            "program": {
+                                "type": "string",
+                                "description": "Path to the executable to debug",
+                                "default": "${workspaceFolder}/program.exe"
+                            },
+                            "args": {
+                                "type": "array",
+                                "description": "Command line arguments passed to the program",
+                                "items": {"type": "string"},
+                                "default": []
+                            },
+                            "cwd": {
+                                "type": "string",
+                                "description": "Working directory for the program",
+                                "default": "${workspaceFolder}"
+                            },
+                            "stopOnEntry": {
+                                "type": "boolean",
+                                "description": "Automatically stop program after launch",
+                                "default": false
+                            },
+                            "environment": {
+                                "type": "array",
+                                "description": "Environment variables",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "value": {"type": "string"}
+                                    }
+                                },
+                                "default": []
+                            }
+                        }
+                    },
+                    "attach": {
+                        "required": ["processId"],
+                        "properties": {
+                            "processId": {
+                                "type": "integer",
+                                "description": "Process ID to attach to",
+                                "default": 0
+                            }
+                        }
+                    }
+                },
+                "initialConfigurations": [
+                    {
+                        "name": "Launch C++ Program",
+                        "type": "cdb-cpp",
+                        "request": "launch",
+                        "program": "${workspaceFolder}/program.exe",
+                        "args": [],
+                        "stopOnEntry": false,
+                        "cwd": "${workspaceFolder}",
+                        "environment": []
+                    }
+                ],
+                "configurationSnippets": [
+                    {
+                        "label": "CDB: Launch C++ Program",
+                        "description": "Launch a C++ program for debugging with CDB",
+                        "body": {
+                            "name": "Launch C++ Program",
+                            "type": "cdb-cpp",
+                            "request": "launch",
+                            "program": "${workspaceFolder}/${1:program.exe}",
+                            "args": [],
+                            "stopOnEntry": false,
+                            "cwd": "${workspaceFolder}",
+                            "environment": []
+                        }
+                    },
+                    {
+                        "label": "CDB: Attach to Process",
+                        "description": "Attach to an existing process with CDB",
+                        "body": {
+                            "name": "Attach to Process",
+                            "type": "cdb-cpp",
+                            "request": "attach",
+                            "processId": "${1:0}"
+                        }
+                    }
+                ]
+            }
+        ]
+    },
+    "main": "./extension.js",
+    "activationEvents": [
+        "onDebug"
+    ]
+}
