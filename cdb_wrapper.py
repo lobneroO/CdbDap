@@ -654,14 +654,17 @@ class EnhancedCdbDebugger:
 
     def step_over(self):
         """Step over current line"""
+        self.was_stepping = True  # Track that we initiated a step
         self.communicator.send_command('p')
 
     def step_into(self):
         """Step into function call"""
+        self.was_stepping = True  # Track that we initiated a step
         self.communicator.send_command('t')
 
     def step_out(self):
         """Step out of current function"""
+        self.was_stepping = True  # Track that we initiated a step
         self.communicator.send_command('gu')
 
     def pause(self):
@@ -820,9 +823,9 @@ class EnhancedCdbDebugger:
                     # Check if this location matches any of our set breakpoints
                     breakpoint_hit = False
                     for bp_id, bp in self.breakpoints.items():
-                        if (bp.file and bp.line and 
-                            file_path.lower().endswith(bp.file.lower()) and 
-                            bp.line == line_num):
+                        if (bp.get('file') and bp.get('line') and 
+                            file_path.lower().endswith(bp['file'].lower()) and 
+                            bp['line'] == line_num):
                             logger.info(f"Confirmed breakpoint hit at {file_path}:{line_num} (BP ID: {bp_id})")
                             breakpoint_hit = True
                             break
@@ -884,9 +887,9 @@ class EnhancedCdbDebugger:
                         # Check if this location matches any of our set breakpoints
                         breakpoint_hit = False
                         for bp_id, bp in self.breakpoints.items():
-                            if (bp.file and bp.line and 
-                                file_path.lower().endswith(bp.file.lower()) and 
-                                bp.line == line_num):
+                            if (bp.get('file') and bp.get('line') and 
+                                file_path.lower().endswith(bp['file'].lower()) and 
+                                bp['line'] == line_num):
                                 logger.info(f"Confirmed breakpoint hit at {file_path}:{line_num} (BP ID: {bp_id})")
                                 breakpoint_hit = True
                                 break
@@ -915,6 +918,19 @@ class EnhancedCdbDebugger:
                     }
             
             logger.debug("No event detected in output")
+
+        # Check if we were stepping and now have a prompt with instruction info
+        if (hasattr(self, 'was_stepping') and self.was_stepping and 
+            ('0:000>' in output or '>' in output[-10:]) and 
+            ('!main+' in output or re.search(r'[0-9a-f]{8}`[0-9a-f]{8}', output))):
+            logger.info("Detected step completion - stopped after stepping")
+            self.was_stepping = False
+            self.is_stopped = True
+            return {
+                'type': 'stopped',
+                'reason': 'step',
+                'threadId': self.current_thread_id or 1
+            }
 
         return None
 
