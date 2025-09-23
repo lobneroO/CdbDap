@@ -1,148 +1,75 @@
-# CDB DAP Server
+# CdbDap
+CdbDap is a wrapper around Microsoft's [cdb cli debugger](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/cdb-command-line-options), implementing the [debug adapter protocol](https://microsoft.github.io/debug-adapter-protocol//).
+_CdbDap is in a very early state. You'll likely be as frustrated with it as you were without it._
 
-A Debug Adapter Protocol (DAP) implementation for C++ debugging using Microsoft's Console Debugger (CDB).
+## About CdbDap creation
+I had my fraind create most of this DAP wrapper for me.
+While they didn't have a perfect solution, we improved it to get some basic functionality.
+In the program I am testing this on, setting a breakpoint, using continue, step over[^1] and step into / out of worked to some extent.
 
-## Overview
+[^1] cdb does not step over per C++ line, so using this in CdbDap will sometimes step into the same C++ line again - you may have to "step over" a few times until it reaches the next line of C++ code.
 
-This implementation provides a DAP server that bridges between debug clients (like VS Code) and the Windows Console Debugger (CDB) to enable debugging of C++ applications on Windows.
+## Why
+At work I have to compile with MSVC.
+I use neovim for most of my editing, but currently, there is no good way of debugging MSVC binaries in neovim (see [Alternatives](#alternatives)).
+Visual Studio is a major pain with how slow it is, so I was as frustrated as you likely are, if you landed here.
+Thus, after finding that the alternatives are very cumbersome and/or insufficient, here we are.
 
-## Features
+## Continued development
+Since my fraind did most of the work, you may find the code to not be great at times.
+If you think you can do better: Great, that makes two of us! 
+Please help out.
+Fork the project and improve upon it.
+Write a DAP from scratch that doesn't need cdb.
+There are plenty of ways the solution could be better than what this is.
 
-- **Full DAP Support**: Implements the Debug Adapter Protocol specification
-- **CDB Integration**: Uses Microsoft's CDB for actual debugging operations
-- **Breakpoint Management**: Set, remove, and manage breakpoints
-- **Stack Trace Inspection**: View call stacks and navigate frames
-- **Variable Inspection**: Examine local and global variables
-- **Step Debugging**: Step over, into, and out of functions
-- **Expression Evaluation**: Evaluate expressions in the debugger context
-- **Multi-threading Support**: Debug multi-threaded applications
-- **CMake Build System**: Modern CMake-based build configuration
+I am neither an expert in using cdb, nor in writing DAP servers.
+I'm just fumbling my way through this entire ordeal in the hopes of some day not needing to open Visual Studio every day.
+I may not ever finish this - don't hold your breath.
 
-## Requirements
+## Alterantives
+Of course, debugging C++ code on Windows can be done more easily:
+* Visual Studio and Visual Studio Code perfectly support MSVC binary debugging. Boy do I hate both of them.
+* lldb has some support for debugging MSVC binaries and CodeLLDB is easily integrated. It didn't suffice for the program I'm debugging.
+* CLion has good support for MSVC binaries in their lldb version, as far as I can tell. Sadly, it doesn't come with the DAP implementation that the original lldb has, so I cannot use it in my editor.
+* You may not need MSVC to compile! If you can use clang, do it and use lldb instead!
+* There is a hack to use vsdbg (the VS Code DAP), but that is _very_ cumbersome to setup. This may be your best bet though. In general, the license doesn't allow to use this outside of VS / VSC.
 
-- Windows operating system
-- Microsoft Debugging Tools for Windows (includes cdb.exe)
-- Python 3.7 or higher
-- CMake 3.16 or higher
-- Visual Studio Code or another DAP-compatible editor/IDE
-
-## Installation
-
-1. Install Microsoft Debugging Tools for Windows:
-   - Download from Microsoft's website or install Windows SDK
-   - Ensure `cdb.exe` is in your PATH
-
-2. Install CMake:
-   - Download from [cmake.org](https://cmake.org/download/)
-   - Ensure `cmake` is in your PATH
-
-3. Clone or download this repository
-
-4. Install Python dependencies (optional):pip install -r requirements.txt
 ## Usage
+If you looked at the alternatives and still want to give this a try, have a look at the [usage](USAGE.md) file my fraind created.
+If you want to use it in neovim, make sure you have all prerequesits (Python, Cdb, ... - see usage) installed and cdb.exe is in your path.
+Then add the following to your dap setup:
 
-### Building the Test Program
+```
+local dap = require('dap')
 
-The test program is located in the `test_program/` directory and uses CMake for building:
-cd test_program
-mkdir build
-cd build
-cmake ..
-cmake --build . --config Debug
-This will create a debug-enabled executable with all necessary symbols for debugging.
-
-### With VS Code
-
-1. Copy the `.vscode` directory to your C++ project
-2. Modify the `launch.json` configuration:
-   - Set the correct path to your executable
-   - For the test program, use: `"program": "${workspaceFolder}/test_program/build/Debug/test_program.exe"`
-   - Adjust other settings as needed
-3. Start debugging by pressing F5 or using the Debug menu
-
-### Standalone Usage
-
-Run the DAP server directly:
-python dap_server.py
-The server will listen for DAP messages on stdin/stdout.
-
-## Configuration
-
-### Launch Configuration
-
-Example `launch.json` configuration for the test program:
-{
-    "name": "Debug Test Program",
-    "type": "cppdbg",
-    "request": "launch",
-    "program": "${workspaceFolder}/test_program/build/Debug/test_program.exe",
-    "args": [],
-    "stopAtEntry": false,
-    "cwd": "${workspaceFolder}/test_program/build",
-    "environment": []
+dap.adapters.cdbdap = {
+    type = 'server',
+    host = '127.0.0.1',
+    port = 13000
 }
-### Build Configuration
 
-The test program includes a comprehensive CMakeLists.txt that handles:
 
-- **Debug Information**: Automatically generates debug symbols (`/Zi` on MSVC, `-g` on GCC/Clang)
-- **Build Types**: Debug, Release, and RelWithDebInfo configurations
-- **Cross-platform**: Works on Windows (MSVC) and Linux (GCC/Clang)
-- **Parallel Compilation**: Enables `/MP` flag on MSVC for faster builds
-
-The included VS Code `tasks.json` provides build tasks using CMake:
-{
-    "label": "CMake Build Debug",
-    "type": "shell",
-    "command": "cmake",
-    "args": [
-        "--build", 
-        "${workspaceFolder}/test_program/build",
-        "--config", "Debug"
-    ],
-    "group": "build"
+dap.configurations.cpp = {
+    {
+        name = "Launch with cdbdap",
+        type = "cdbdap",
+        request = "launch",
+        program = function()
+            return vim.fn.input('Path to executable: ', vim.fn.getcwd() .. '/', 'file')
+        end,
+        cwd = '${workspaceFolder}',
+        args = {},
+    }
 }
-## Architecture
+```
 
-### Components
+With everything set up, start `python dap_server.py` and then start a debugging session which connects to the server.
 
-1. **DAPServer**: Main server class handling DAP protocol
-2. **CdbDebugger**: Interface to CDB debugger process
-3. **EnhancedCdbDebugger**: Advanced CDB wrapper with better parsing
-4. **CdbOutputParser**: Parses CDB output for structured information
-5. **CdbCommunicator**: Handles low-level CDB process communication
+## Issues
+As this is an early state, there are lots of issues. Some of them are listed here - so you have been warned.
 
-### Communication Flow
-VS Code <-> DAP Protocol <-> DAPServer <-> CdbDebugger <-> CDB.exe
-### Project Structure
-CdbDap/
-??? dap_server.py           # Main DAP server
-??? cdb_wrapper.py          # Enhanced CDB interface  
-??? launcher.py             # Launcher script
-??? test_dap.py            # Test suite
-??? requirements.txt       # Python dependencies
-??? README.md              # This file
-??? SETUP_GUIDE.md         # Detailed setup guide
-??? package.json           # VS Code extension manifest
-??? .vscode/
-?   ??? launch.json        # Debug configurations
-?   ??? tasks.json         # Build tasks
-??? test_program/
-    ??? test_program.cpp   # Sample C++ program
-    ??? CMakeLists.txt     # CMake build configuration
-    ??? build/             # Build output (created during build)
-## Supported DAP Requests
-
-- `initialize` - Initialize the debug adapter
-- `launch` - Launch a program for debugging
-- `attach` - Attach to an existing process
-- `setBreakpoints` - Set/remove breakpoints
-- `configurationDone` - Configuration complete
-- `continue` - Continue execution
-- `next` - Step over
-- `stepIn` - Step into
-- `stepOut` - Step out
-- `pause` - Pause execution
-- `threads` - Get thread list
-- `stackTrace` - Get stack trace
-- `scopes
+* Slow startup times - When launching a debug session (in neovim anyway), it takes some time until your first breakpoint is hit, even if that breakpoint is the first line in your main function
+* Step Over - This doesn't work on the actual C++ lines, but on some logic inside cdb. You may have to step multiple times, before the next line is reached.
+* Errors not caught correctly - In my program I'm trying this out on, there is a line of code that I haven't been able to get past; still neovim never showed me that the debugger stopped executing. The program didn't crash.
+* StopOnEntry - Not supported yet. cdb has a stop on entry functionality, but if you have debugged in lldb or gdb before, you expect this to stop at the beginning of the main function. cdb stops elsewhere, so for now this is "disabled".
