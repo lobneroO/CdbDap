@@ -362,36 +362,49 @@ class SocketDAPServer:
             try:
                 logger.info("Moving debugger from loader breakpoint to main entry...")
                 self.debugger.go_to_main_entry()
-                logger.info("Debugger should now be at main entry point")
+                logger.info("Debugger positioned, checking if we need to send stopped event")
                 
-                # Get current location to include in stopped event
-                file_path, line_num = self.debugger.get_current_location()
-                logger.info(f"Current location after moving to main: {file_path}:{line_num}")
-                
-                # Send a stopped event with location information
-                stopped_event = {
-                    'reason': 'entry',
-                    'threadId': 1,
-                    'allThreadsStopped': True
-                }
-                
-                # Add source location if we have it
-                if file_path and line_num > 0:
-                    stopped_event['source'] = {
-                        'name': os.path.basename(file_path),
-                        'path': file_path
+                # After go_to_main_entry(), the debugger should be stopped at main or at a user breakpoint
+                # Check if it's stopped and get the current location
+                if self.debugger.is_stopped:
+                    file_path, line_num = self.debugger.get_current_location()
+                    logger.info(f"Debugger is stopped at: {file_path}:{line_num}")
+                    
+                    # Check if this location matches a user breakpoint
+                    reason = 'entry'  # Default to entry
+                    for bp_id, (bp_file, bp_line) in self.breakpoint_locations.items():
+                        if file_path and bp_file in file_path and line_num == bp_line:
+                            logger.info(f"Current location matches breakpoint {bp_id} at {bp_file}:{bp_line}")
+                            reason = 'breakpoint'
+                            break
+                    
+                    # Send the appropriate stopped event
+                    stopped_event = {
+                        'reason': reason,
+                        'threadId': 1,
+                        'allThreadsStopped': True
                     }
-                    stopped_event['line'] = line_num
-                    stopped_event['column'] = 1
-                
-                self.send_event('stopped', stopped_event)
+                    
+                    # Add source location if we have it
+                    if file_path and line_num > 0:
+                        stopped_event['source'] = {
+                            'name': os.path.basename(file_path),
+                            'path': file_path
+                        }
+                        stopped_event['line'] = line_num
+                        stopped_event['column'] = 1
+                    
+                    logger.info(f"Sending stopped event: {stopped_event}")
+                    self.send_event('stopped', stopped_event)
+                else:
+                    logger.warning("Debugger not stopped after go_to_main_entry()")
                 
             except Exception as e:
                 logger.error(f"Error moving to main entry: {e}")
                 import traceback
                 logger.error(f"Traceback: {traceback.format_exc()}")
                 
-                # Send a basic stopped event even if location detection failed
+                # If there's an error, send a basic stopped event as fallback
                 self.send_event('stopped', {
                     'reason': 'entry',
                     'threadId': 1,

@@ -418,6 +418,9 @@ class EnhancedCdbDebugger:
         self.next_bp_id = 1
         self.current_thread_id = 0
         self.is_stopped = True
+        self.recent_exception = None  # Track recent exceptions
+        import time
+        self.exception_time = 0  # Track when exception occurred
 
     def start(self, program: str, args: List[str] = None,
               cwd: str = None) -> bool:
@@ -570,7 +573,7 @@ class EnhancedCdbDebugger:
             self.was_continuing = False
 
     def go_to_main_entry(self):
-        """Move from initial loader breakpoint to main function entry"""
+        """Move from initial loader breakpoint to main function entry or first user breakpoint"""
         logger.info("Moving from loader breakpoint to main entry point...")
         
         # Check current stack to confirm we're at loader breakpoint
@@ -579,21 +582,24 @@ class EnhancedCdbDebugger:
         
         if "ntdll!" in stack_output and ("Ldr" in stack_output or "DbgBreak" in stack_output):
             logger.info("Confirmed at loader breakpoint, going to main...")
-            # Set temporary breakpoint at main and continue
-            self.communicator.send_command("bp main")
+            
+            # Instead of setting a temporary main breakpoint, just continue
+            # This will let CDB naturally hit any user breakpoints on the way to main
+            logger.info("Continuing execution to reach main or hit user breakpoints...")
             self.communicator.send_command("g")
             
-            # Give it a moment to reach main
-            time.sleep(0.2)
+            # Give it a moment to reach the destination
+            time.sleep(0.5)
             
             # Check where we ended up
             new_stack = self.communicator.send_command("k")
-            logger.info(f"Stack after going to main: {new_stack}")
+            logger.info(f"Stack after continuing: {new_stack}")
             
-            # Clear the temporary main breakpoint
-            self.communicator.send_command("bc 0")  # Clear breakpoint 0 (main)
+            # Check if we hit a user breakpoint or reached main
+            bl_output = self.communicator.send_command("bl")
+            logger.info(f"Current breakpoints after continue: {bl_output}")
             
-            self.is_stopped = True  # Mark as stopped at main
+            self.is_stopped = True  # Mark as stopped wherever we ended up
         else:
             logger.info("Not at loader breakpoint, skipping go-to-main")
     
@@ -602,91 +608,42 @@ class EnhancedCdbDebugger:
         try:
             logger.debug("Getting current location...")
             
-            # Method 1: Use 'k=1' to get stack with source info for current frame
-            kstack_output = self.communicator.send_command("k=1 1")
-            logger.debug(f"Stack with source info: {kstack_output}")
-            
-            # Method 2: Use '.lines' to enable line number information, then get current frame
+            # Enable line number information first
             self.communicator.send_command(".lines -e")
-            frame_output = self.communicator.send_command("k 1")
-            logger.debug(f"Frame output with lines enabled: {frame_output}")
             
-            # Method 3: Use 'ln' (list nearest) to get symbol information
+            # Get stack frame with source info - this is most reliable
+            frame_output = self.communicator.send_command("k 1")
+            logger.debug(f"Frame output: {frame_output}")
+            
+            # Get ln output as backup
             ln_output = self.communicator.send_command("ln .")
             logger.debug(f"List nearest output: {ln_output}")
             
-            # Method 4: Try to get the source line directly using 'lsa'
-            source_output = self.communicator.send_command("lsa .")
-            logger.debug(f"List source around: {source_output}")
-            
-            # Method 5: Use '.frame' to get detailed frame info
-            frame_detailed = self.communicator.send_command(".frame")
-            logger.debug(f"Detailed frame info: {frame_detailed}")
-            
-            # Try to parse various outputs for source information
             import re
             
-            # Parse k=1 output first (most reliable)
-            if kstack_output:
-                # Look for patterns in stack output with source info
-                # Format might be like: "VisionSym!main+0x123 [c:\path\file.cpp @ 285]"
-                source_patterns = [
-                    r'\[([^@]+)\s*@\s*(\d+)\]',  # [filename @ line]
-                    r'\(([^)]+):(\d+)\)',  # (filename:line)
-                    r'([a-zA-Z]:[^:\s]+\.[a-zA-Z]+)\s*:\s*(\d+)',  # path\file.ext : line
-                ]
-                
-                for pattern in source_patterns:
-                    match = re.search(pattern, kstack_output)
-                    if match:
-                        file_path = match.group(1).strip()
-                        line_num = int(match.group(2))
-                        logger.info(f"Found location via stack command: {file_path}:{line_num}")
-                        return file_path, line_num
+            # Try to parse frame output first (most reliable after .lines -e)
+            # Format: "VisionSym!main [C:\Users\...\main.cxx @ 281]"
+            if frame_output:
+                match = re.search(r'\[([^@]+)\s*@\s*(\d+)\]', frame_output)
+                if match:
+                    file_path = match.group(1).strip().replace('\\\\', '\\')  # Fix double backslashes
+                    line_num = int(match.group(2))
+                    logger.info(f"Found location via frame output: {file_path}:{line_num}")
+                    return file_path, line_num
             
-            # Parse ln output
+            # Try to parse ln output as backup
+            # Format: "C:\path\file.ext(line)"
             if ln_output:
-                # ln output format: (address) module!function+offset | (filename:line)
-                source_patterns = [
-                    r'\[([^@]+)\s*@\s*(\d+)\]',  # [filename @ line]
-                    r'\(([^)]+):(\d+)\)',  # (filename:line)
-                    r'([a-zA-Z]:[^:\s]+\.[a-zA-Z]+)\s*:\s*(\d+)',  # path\file.ext : line
-                ]
-                
-                for pattern in source_patterns:
-                    match = re.search(pattern, ln_output)
-                    if match:
-                        file_path = match.group(1).strip()
-                        line_num = int(match.group(2))
-                        logger.info(f"Found location via ln command: {file_path}:{line_num}")
-                        return file_path, line_num
+                match = re.search(r'([a-zA-Z]:[^(]+\.(?:cpp|cxx|c|h|hpp))\((\d+)\)', ln_output)
+                if match:
+                    file_path = match.group(1).strip()
+                    line_num = int(match.group(2))
+                    logger.info(f"Found location via ln output: {file_path}:{line_num}")
+                    return file_path, line_num
             
-            # Parse source output (lsa) for line numbers
-            if source_output:
-                # Look for current line indicators in source output
-                lines = source_output.split('\n')
-                for line in lines:
-                    line = line.strip()
-                    # Look for ">" indicator showing current line
-                    if '>' in line and ':' in line:
-                        # Format might be: "> 285: code here"
-                        match = re.match(r'>\s*(\d+):', line)
-                        if match:
-                            line_num = int(match.group(1))
-                            logger.info(f"Found line number from source listing: {line_num}")
-                            # We have the line but need to find the file
-                            # Try to extract file from other commands
-                            for cmd_output in [kstack_output, ln_output, frame_detailed]:
-                                if cmd_output:
-                                    file_match = re.search(r'([a-zA-Z]:[^:\s]+\.[a-zA-Z]+)', cmd_output)
-                                    if file_match:
-                                        file_path = file_match.group(1).strip()
-                                        logger.info(f"Found file from other output: {file_path}")
-                                        return file_path, line_num
-                            # If we have line but no file, still return the line
-                            return None, line_num
-            
-            logger.warning("Could not determine current location from any CDB command")
+            logger.warning("Could not determine current location from CDB output")
+            logger.debug(f"Frame output was: {repr(frame_output)}")
+            logger.debug(f"LN output was: {repr(ln_output)}")
             return None, 0
             
         except Exception as e:
@@ -835,22 +792,58 @@ class EnhancedCdbDebugger:
 
     def check_for_events(self) -> Optional[Dict[str, Any]]:
         """Check for debugging events (breakpoints, exceptions, etc.)"""
+        import time
+        
         output = self.communicator.get_unsolicited_output()
         if not output:
             return None
 
         logger.debug(f"Checking unsolicited output: {repr(output[:200])}")
 
+        # Check for exceptions first and track them
+        if ('first chance' in output.lower() or 'second chance' in output.lower() or 
+            'illegal instruction' in output.lower() or 'access violation' in output.lower()):
+            logger.info(f"Detected exception - will be ignored: {output[:100]}...")
+            # Don't treat exceptions as breakpoint hits
+            return None
+
         # Parse output for events
         if ('Breakpoint' in output or 'breakpoint' in output.lower() or 
             'stopped at' in output.lower()):
-            self.is_stopped = True
-            logger.info("Detected breakpoint hit")
-            return {
-                'type': 'stopped',
-                'reason': 'breakpoint',
-                'threadId': self.current_thread_id or 1
-            }
+            logger.info("Detected possible breakpoint message in output")
+            
+            # Before declaring this a breakpoint, let's verify we're actually at a real breakpoint
+            # by checking the current location against our set breakpoints
+            try:
+                file_path, line_num = self.get_current_location()
+                if file_path and line_num > 0:
+                    # Check if this location matches any of our set breakpoints
+                    breakpoint_hit = False
+                    for bp_id, bp in self.breakpoints.items():
+                        if (bp.file and bp.line and 
+                            file_path.lower().endswith(bp.file.lower()) and 
+                            bp.line == line_num):
+                            logger.info(f"Confirmed breakpoint hit at {file_path}:{line_num} (BP ID: {bp_id})")
+                            breakpoint_hit = True
+                            break
+                    
+                    if breakpoint_hit:
+                        self.is_stopped = True
+                        return {
+                            'type': 'stopped', 
+                            'reason': 'breakpoint',
+                            'threadId': self.current_thread_id or 1
+                        }
+                    else:
+                        logger.info(f"Breakpoint message at {file_path}:{line_num} - not a user breakpoint, ignoring")
+                        return None
+                else:
+                    logger.warning("Could not get current location for breakpoint verification")
+                    return None
+            except Exception as e:
+                logger.error(f"Error verifying breakpoint location: {e}")
+                # Don't fall back to old behavior - if we can't verify, don't treat it as a breakpoint
+                return None
         elif ('Break instruction exception' in output or 
               'Break exception' in output or
               'Int 3' in output):
@@ -876,18 +869,50 @@ class EnhancedCdbDebugger:
                 'exitCode': 0
             }
         else:
+            
             # Sometimes CDB doesn't send explicit breakpoint messages
             # If we see a prompt but were in continue state, check if we might have hit a breakpoint
             if ('>' in output and len(output) < 50 and 
                 hasattr(self, 'was_continuing') and self.was_continuing):
                 logger.info("Detected possible breakpoint hit (short prompt after continue)")
-                self.was_continuing = False
-                self.is_stopped = True
-                return {
-                    'type': 'stopped', 
-                    'reason': 'breakpoint',
-                    'threadId': self.current_thread_id or 1
-                }
+                
+                # Before declaring this a breakpoint, let's verify we're actually at a real breakpoint
+                # by checking the current location against our set breakpoints
+                try:
+                    file_path, line_num = self.get_current_location()
+                    if file_path and line_num > 0:
+                        # Check if this location matches any of our set breakpoints
+                        breakpoint_hit = False
+                        for bp_id, bp in self.breakpoints.items():
+                            if (bp.file and bp.line and 
+                                file_path.lower().endswith(bp.file.lower()) and 
+                                bp.line == line_num):
+                                logger.info(f"Confirmed breakpoint hit at {file_path}:{line_num} (BP ID: {bp_id})")
+                                breakpoint_hit = True
+                                break
+                        
+                        if breakpoint_hit:
+                            self.was_continuing = False
+                            self.is_stopped = True
+                            return {
+                                'type': 'stopped', 
+                                'reason': 'breakpoint',
+                                'threadId': self.current_thread_id or 1
+                            }
+                        else:
+                            logger.info(f"Short prompt at {file_path}:{line_num} - not a user breakpoint, ignoring")
+                            self.was_continuing = False
+                            return None
+                except Exception as e:
+                    logger.error(f"Error verifying breakpoint location: {e}")
+                    # Fall back to old behavior if verification fails
+                    self.was_continuing = False
+                    self.is_stopped = True
+                    return {
+                        'type': 'stopped', 
+                        'reason': 'breakpoint',
+                        'threadId': self.current_thread_id or 1
+                    }
             
             logger.debug("No event detected in output")
 
