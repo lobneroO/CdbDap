@@ -84,6 +84,9 @@ class SocketDAPServer:
         self.client_socket = None
         self.running = True
         
+        # Map breakpoint IDs to their source locations
+        self.breakpoint_locations = {}  # bp_id -> (file_path, line)
+        
         try:
             self.debugger = EnhancedCdbDebugger()
             logger.info("Successfully created CDB debugger instance")
@@ -257,18 +260,27 @@ class SocketDAPServer:
     def handle_launch(self, request: Dict[str, Any]):
         """Handle launch request"""
         logger.info("Handling launch request")
+        logger.info(f"Launch request arguments: {request.get('arguments', {})}")
+        
         args = request.get('arguments', {})
         program = args.get('program')
 
         if not program:
+            error_msg = 'No program specified in launch arguments'
+            logger.error(error_msg)
             self.send_response(request['seq'], 'launch',
-                               False, 'No program specified')
+                               False, error_msg)
             return
 
-        try:
-            entry_func = args.get('entryFunction', 'main')
-            self.debugger.set_breakpoint(program, entry_func)
+        logger.info(f"Attempting to launch program: {program}")
+        
+        # Convert relative path to absolute if needed
+        if not os.path.isabs(program):
+            cwd = args.get('cwd', os.getcwd())
+            program = os.path.join(cwd, program)
+            logger.info(f"Converted to absolute path: {program}")
 
+        try:
             success = self.debugger.start(
                 program=program,
                 args=args.get('args', []),
@@ -277,21 +289,22 @@ class SocketDAPServer:
 
             if success:
                 self.is_running = True
+                logger.info("Debugger started successfully, sending launch response")
                 self.send_response(request['seq'], 'launch')
-                # if args.get('stopOnEntry', False):
-                self.send_event('stopped', {
-                    'reason': 'entry',
-                    'threadId': 1,
-                    'allThreadsStopped': True
-                })
-                # else:
-                #     self.debugger.continue_execution()
+                # Don't send stopped event here - we'll send it after configurationDone
+                # when we've moved from loader breakpoint to main
+                logger.info("Waiting for configurationDone to move to main entry point")
             else:
+                error_msg = f'Failed to start debugger for program: {program}'
+                logger.error(error_msg)
                 self.send_response(request['seq'], 'launch',
-                                   False, 'Failed to start debugger')
+                                   False, error_msg)
         except Exception as e:
-            logger.error(f"Error in handle_launch: {e}")
-            self.send_response(request['seq'], 'launch', False, str(e))
+            error_msg = f"Error in handle_launch: {e}"
+            logger.error(error_msg)
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            self.send_response(request['seq'], 'launch', False, error_msg)
 
     def handle_set_breakpoints(self, request: Dict[str, Any]):
         """Handle setBreakpoints request"""
@@ -312,6 +325,10 @@ class SocketDAPServer:
                 if line:
                     try:
                         bp_id = self.debugger.set_breakpoint(file_path, line)
+                        # Store breakpoint location for later reference
+                        self.breakpoint_locations[bp_id] = (file_path, line)
+                        logger.info(f"Stored breakpoint {bp_id} at {file_path}:{line}")
+                        
                         result_breakpoints.append(Breakpoint(
                             id=bp_id,
                             verified=True,
@@ -338,6 +355,49 @@ class SocketDAPServer:
     def handle_configuration_done(self, request: Dict[str, Any]):
         """Handle configurationDone request"""
         logger.info("Handling configurationDone request")
+        
+        # This is called after breakpoints are set, so now we can move from 
+        # the initial loader breakpoint to main entry point
+        if self.debugger and self.is_running:
+            try:
+                logger.info("Moving debugger from loader breakpoint to main entry...")
+                self.debugger.go_to_main_entry()
+                logger.info("Debugger should now be at main entry point")
+                
+                # Get current location to include in stopped event
+                file_path, line_num = self.debugger.get_current_location()
+                logger.info(f"Current location after moving to main: {file_path}:{line_num}")
+                
+                # Send a stopped event with location information
+                stopped_event = {
+                    'reason': 'entry',
+                    'threadId': 1,
+                    'allThreadsStopped': True
+                }
+                
+                # Add source location if we have it
+                if file_path and line_num > 0:
+                    stopped_event['source'] = {
+                        'name': os.path.basename(file_path),
+                        'path': file_path
+                    }
+                    stopped_event['line'] = line_num
+                    stopped_event['column'] = 1
+                
+                self.send_event('stopped', stopped_event)
+                
+            except Exception as e:
+                logger.error(f"Error moving to main entry: {e}")
+                import traceback
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                
+                # Send a basic stopped event even if location detection failed
+                self.send_event('stopped', {
+                    'reason': 'entry',
+                    'threadId': 1,
+                    'allThreadsStopped': True
+                })
+        
         self.send_response(request['seq'], 'configurationDone')
 
     def handle_continue(self, request: Dict[str, Any]):
@@ -504,6 +564,18 @@ class SocketDAPServer:
             'breakpoints': []
         })
 
+    def handle_terminate(self, request: Dict[str, Any]):
+        """Handle terminate request"""
+        logger.info("Handling terminate request")
+        self.is_running = False
+        self.running = False
+        if self.debugger:
+            try:
+                self.debugger.terminate()
+            except Exception as e:
+                logger.error(f"Error terminating debugger: {e}")
+        self.send_response(request['seq'], 'terminate')
+
     def run(self):
         """Main message loop using socket"""
         logger.info("Starting Socket DAP Server message loop...")
@@ -524,6 +596,7 @@ class SocketDAPServer:
             'variables': self.handle_variables,
             'evaluate': self.handle_evaluate,
             'disconnect': self.handle_disconnect,
+            'terminate': self.handle_terminate,
             'setExceptionBreakpoints': self.handle_set_exception_breakpoints,
         }
 
@@ -535,6 +608,74 @@ class SocketDAPServer:
 
             while self.running:
                 try:
+                    # Check for debugging events (breakpoints, exceptions, etc.)
+                    if self.debugger and self.is_running:
+                        event = self.debugger.check_for_events()
+                        if event:
+                            logger.info(f"Debugger event detected: {event}")
+                            if event['type'] == 'stopped':
+                                # Get current location for the stopped event
+                                try:
+                                    file_path, line_num = self.debugger.get_current_location()
+                                    stopped_body = {
+                                        'reason': event['reason'],
+                                        'threadId': event['threadId'],
+                                        'allThreadsStopped': True
+                                    }
+                                    
+                                    # Add source location if available
+                                    if file_path and line_num > 0:
+                                        stopped_body['source'] = {
+                                            'name': os.path.basename(file_path),
+                                            'path': file_path
+                                        }
+                                        stopped_body['line'] = line_num
+                                        stopped_body['column'] = 1
+                                        logger.info(f"Using detected source location: {file_path}:{line_num}")
+                                    else:
+                                        # Fallback: If we can't get source from CDB but this is a breakpoint,
+                                        # try to use our stored breakpoint locations
+                                        if event['reason'] == 'breakpoint':
+                                            logger.info("No source detected from CDB, checking breakpoint map...")
+                                            # Try to find which breakpoint was hit by checking the debugger's breakpoint list
+                                            try:
+                                                current_bp_list = self.debugger.list_breakpoints()
+                                                logger.info(f"Current breakpoints from debugger: {current_bp_list}")
+                                                
+                                                # Look for a breakpoint that matches our stored locations
+                                                for bp_id, (bp_file, bp_line) in self.breakpoint_locations.items():
+                                                    logger.info(f"Checking stored breakpoint {bp_id}: {bp_file}:{bp_line}")
+                                                    # For now, use the first breakpoint location as fallback
+                                                    # In a more sophisticated version, we could parse CDB output
+                                                    # to determine exactly which breakpoint was hit
+                                                    if self.breakpoint_locations:
+                                                        fallback_file, fallback_line = next(iter(self.breakpoint_locations.values()))
+                                                        stopped_body['source'] = {
+                                                            'name': os.path.basename(fallback_file),
+                                                            'path': fallback_file
+                                                        }
+                                                        stopped_body['line'] = fallback_line
+                                                        stopped_body['column'] = 1
+                                                        logger.info(f"Using fallback breakpoint location: {fallback_file}:{fallback_line}")
+                                                        break
+                                            except Exception as fallback_e:
+                                                logger.error(f"Error in breakpoint fallback: {fallback_e}")
+                                    
+                                    self.send_event('stopped', stopped_body)
+                                except Exception as e:
+                                    logger.error(f"Error getting location for stopped event: {e}")
+                                    # Send basic stopped event without location
+                                    self.send_event('stopped', {
+                                        'reason': event['reason'],
+                                        'threadId': event['threadId'],
+                                        'allThreadsStopped': True
+                                    })
+                            elif event['type'] == 'exited':
+                                self.send_event('exited', {
+                                    'exitCode': event['exitCode']
+                                })
+                                self.is_running = False
+
                     # Read data from socket
                     data = self.client_socket.recv(4096)
                     if not data:
