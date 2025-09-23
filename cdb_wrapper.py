@@ -655,12 +655,12 @@ class EnhancedCdbDebugger:
     def step_over(self):
         """Step over current line"""
         self.was_stepping = True  # Track that we initiated a step
-        self.communicator.send_command('p')
+        self.communicator.send_command('pc')  # Source-level step over
 
     def step_into(self):
         """Step into function call"""
-        self.was_stepping = True  # Track that we initiated a step
-        self.communicator.send_command('t')
+        self.was_stepping = True  # Track that we initiated a step  
+        self.communicator.send_command('tc')  # Source-level step into
 
     def step_out(self):
         """Step out of current function"""
