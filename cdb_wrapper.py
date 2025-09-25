@@ -652,15 +652,42 @@ class EnhancedCdbDebugger:
             logger.error(f"Traceback: {traceback.format_exc()}")
             return None, 0
 
+    def _step_until_line_changes(self, step_command, fallback_command, operation_name):
+        """Helper method to step until we reach a different source line"""
+        current_file, current_line = self.get_current_location()
+        logger.debug(f"{operation_name} starting from {current_file}:{current_line}")
+        
+        if not current_file or current_line <= 0:
+            logger.debug(f"Could not get current location, using fallback {fallback_command}")
+            self.communicator.send_command(fallback_command)
+            return
+        
+        max_steps = 50  # Safety limit to prevent infinite loops
+        for step_count in range(1, max_steps + 1):
+            self.communicator.send_command(step_command)
+            new_file, new_line = self.get_current_location()
+            logger.debug(f"After step {step_count}: {new_file}:{new_line}")
+            
+            # Stop if we've moved to a different line/file or can't get location
+            if (new_file != current_file or new_line != current_line or 
+                not new_file or new_line <= 0):
+                if new_file != current_file or new_line != current_line:
+                    logger.debug(f"{operation_name} complete: moved from {current_file}:{current_line} to {new_file}:{new_line}")
+                else:
+                    logger.debug(f"Could not get new location, stopping {operation_name}")
+                break
+        else:
+            logger.warning(f"{operation_name} reached maximum steps ({max_steps}) without changing line")
+
     def step_over(self):
-        """Step over current line"""
-        self.was_stepping = True  # Track that we initiated a step
-        self.communicator.send_command('pc')  # Source-level step over
+        """Step over until we reach a different source line"""
+        self.was_stepping = True
+        self._step_until_line_changes('p', 'pc', 'Step over')
 
     def step_into(self):
-        """Step into function call"""
-        self.was_stepping = True  # Track that we initiated a step  
-        self.communicator.send_command('tc')  # Source-level step into
+        """Step into until we reach a different source line"""
+        self.was_stepping = True
+        self._step_until_line_changes('t', 'tc', 'Step into')
 
     def step_out(self):
         """Step out of current function"""
