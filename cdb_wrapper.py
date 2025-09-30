@@ -53,6 +53,7 @@ class CdbVariable:
     value: str
     type: str
     address: Optional[str] = None
+    is_parameter: bool = False
 
 
 @dataclass
@@ -69,7 +70,12 @@ class CdbOutputParser:
     # Regex patterns for parsing CDB output
     BREAKPOINT_PATTERN = re.compile(r'^\s*(\d+):\s+([0-9a-f`]+)\s+.*?(@#\d+)?\s*(.*)$', re.MULTILINE)
     STACK_FRAME_PATTERN = re.compile(r'^(\d+)\s+([0-9a-f`]+)\s+([0-9a-f`]+)\s+(.+?)(?:\s+\[(.+?)\s+@\s+(\d+)\])?$', re.MULTILINE)
-    VARIABLE_PATTERN = re.compile(r'^([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+?)(?:\s+\[Type:\s+(.+?)\])?$', re.MULTILINE)
+    # Pattern for CDB variable output like:
+    # * pargs = 0x0000002d`5bb8eaf8 { size=0x15 }
+    # prv local  0000002d`5bb8ee38 struct docopt::value settingsArg = struct docopt::value
+    # prv param  0000002d`5bb8f8b0 int argc = 0n1
+    # 0000002d`5bb8ee38 int variable = value
+    VARIABLE_PATTERN = re.compile(r'(?:(?:\*\s+)|(?:prv\s+(?:local|param)\s+)|(?:[0-9a-f`]+\s+(?:[\w:]+\s+)*))([a-zA-Z_][a-zA-Z0-9_:<>]*)\s*=\s*(.+?)$', re.MULTILINE)
     THREAD_PATTERN = re.compile(r'^\s*(\d+)\s+Id:\s+([0-9a-f.]+)\s+Suspend:\s+(\d+)\s+Teb:\s+([0-9a-f`]+)\s+(.*)$', re.MULTILINE)
 
     @classmethod
@@ -143,17 +149,90 @@ class CdbOutputParser:
         return frames
 
     @classmethod
+    def format_variable_value(cls, value: str) -> str:
+        """Format variable values from CDB output for better display"""
+        if not value:
+            return value
+            
+        # Handle CDB decimal number format (0n prefix)
+        if value.startswith('0n'):
+            try:
+                # Extract the decimal number after 0n
+                decimal_part = value[2:]
+                # Verify it's a valid number
+                int(decimal_part)
+                return decimal_part
+            except ValueError:
+                # If parsing fails, return original value
+                pass
+        
+        # Handle CDB hexadecimal format (0x prefix) - keep as is for now
+        # Could be enhanced later to show both hex and decimal
+        
+        return value
+
+    @classmethod
     def parse_variables(cls, output: str) -> List[CdbVariable]:
-        """Parse variable list output"""
+        """Parse variable list output from CDB 'dv' command"""
         variables = []
+        
+        # First, use the regex to find basic variable patterns
         matches = cls.VARIABLE_PATTERN.findall(output)
+        
+        # Also parse variables that appear without prefixes but with = signs
+        # This handles cases like "numbers = { size=... }" and "message = \"...\""
+        simple_var_pattern = re.compile(r'^([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+?)$', re.MULTILINE)
+        simple_matches = simple_var_pattern.findall(output)
+        
+        # Combine both sets of matches, avoiding duplicates
+        all_var_names = set()
+        for match in matches:
+            name, value = match
+            all_var_names.add(name)
+            
+        # Add simple matches that weren't already found
+        for match in simple_matches:
+            name, value = match
+            if name not in all_var_names:
+                matches.append((name, value))
+                all_var_names.add(name)
 
         for match in matches:
-            name, value, var_type = match
+            name, value = match
+            # Extract type information from the variable declaration if available
+            # Look for patterns like "struct docopt::value settingsArg = ..."
+            var_type = "unknown"
+            is_parameter = False
+            
+            # Try to find the line in the output that contains this variable
+            for line in output.split('\n'):
+                if name in line and '=' in line:
+                    # Extract type from lines like "prv local 0x... struct docopt::value settingsArg = ..."
+                    # or "prv param 0x... int argc = ..."
+                    parts = line.split()
+                    for i, part in enumerate(parts):
+                        if part == name and i > 0:
+                            # Check if this is a parameter
+                            if 'param' in parts[:i]:
+                                is_parameter = True
+                            elif 'local' in parts[:i]:
+                                is_parameter = False
+                            
+                            # Look backwards to find the type
+                            type_parts = []
+                            for j in range(i-1, -1, -1):
+                                if parts[j] in ['local', 'param', 'prv'] or parts[j].startswith('0x'):
+                                    break
+                                type_parts.insert(0, parts[j])
+                            if type_parts:
+                                var_type = ' '.join(type_parts)
+                            break
+            
             variables.append(CdbVariable(
                 name=name,
-                value=value,
-                type=var_type or "unknown"
+                value=cls.format_variable_value(value),
+                type=var_type,
+                is_parameter=is_parameter
             ))
 
         return variables
@@ -391,6 +470,17 @@ class CdbCommunicator:
             return self.output_queue.get_nowait()
         except queue.Empty:
             return None
+    
+    def get_any_pending_output(self) -> str:
+        """Get all pending unsolicited output"""
+        output_parts = []
+        while True:
+            try:
+                part = self.output_queue.get_nowait()
+                output_parts.append(part)
+            except queue.Empty:
+                break
+        return '\n'.join(output_parts)
 
     def terminate(self):
         """Terminate CDB process"""
@@ -762,13 +852,30 @@ class EnhancedCdbDebugger:
         if frame_id > 0:
             self.communicator.send_command(f'.frame {frame_id}')
 
+        # Get variables - the output often comes in multiple parts
         response = self.communicator.send_command('dv /t /v')
+        
+        # Also try to get any additional output that might be buffered
+        import time
+        time.sleep(0.1)  # Give CDB time to output all variable info
+        
+        # Get any additional unsolicited output that contains variable info
+        additional_output = self.communicator.get_any_pending_output()
+        if additional_output:
+            response = response + '\n' + additional_output
+            
+        logger.debug(f"Local variables raw response: {repr(response)}")
 
         # Switch back to frame 0
         if frame_id > 0:
             self.communicator.send_command('.frame 0')
 
-        return self.parser.parse_variables(response)
+        all_variables = self.parser.parse_variables(response)
+        # Filter out parameters, keep only local variables
+        variables = [var for var in all_variables if not var.is_parameter]
+        
+        logger.debug(f"Parsed {len(variables)} local variables: {[v.name for v in variables]}")
+        return variables
 
     def get_arguments(self, frame_id: int = 0) -> List[CdbVariable]:
         """Get function arguments for specific frame"""
@@ -776,20 +883,30 @@ class EnhancedCdbDebugger:
         if frame_id > 0:
             self.communicator.send_command(f'.frame {frame_id}')
 
-        # Get function parameters
-        # include parameters
+        # Get function parameters and local variables
         response = self.communicator.send_command('dv /t /v /i')
+        
+        # Also try to get any additional output that might be buffered
+        import time
+        time.sleep(0.1)  # Give CDB time to output all variable info
+        
+        # Get any additional unsolicited output that contains variable info
+        additional_output = self.communicator.get_any_pending_output()
+        if additional_output:
+            response = response + '\n' + additional_output
+            
+        logger.debug(f"Arguments raw response: {repr(response)}")
 
         # Switch back to frame 0
         if frame_id > 0:
             self.communicator.send_command('.frame 0')
 
-        # Filter for parameters only (this is a simplified approach)
-        variables = self.parser.parse_variables(response)
-        # In a real implementation,
-        # you'd distinguish between locals and parameters
-        # Return first 2 as "arguments"
-        return variables[:2] if variables else []
+        # Parse all variables and filter for parameters only
+        all_variables = self.parser.parse_variables(response)
+        arguments = [var for var in all_variables if var.is_parameter]
+        
+        logger.debug(f"Parsed {len(arguments)} function arguments: {[v.name for v in arguments]}")
+        return arguments
 
     def stop(self):
         """Stop the debugger (alias for terminate)"""

@@ -32,8 +32,9 @@ else()
     set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG")
 endif()
 
-# Define the executable target
+# Define the executable targets
 add_executable(test_program test_program.cpp)
+add_executable(test_program_with_args test_program_with_args.cpp)
 
 # Set output directory to current binary directory
 set_target_properties(test_program PROPERTIES
@@ -41,9 +42,17 @@ set_target_properties(test_program PROPERTIES
     OUTPUT_NAME "test_program"
 )
 
+set_target_properties(test_program_with_args PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    OUTPUT_NAME "test_program_with_args"
+)
+
 # Ensure debug symbols are generated for all build types on Windows
 if(WIN32)
     set_target_properties(test_program PROPERTIES
+        VS_DEBUGGER_WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    )
+    set_target_properties(test_program_with_args PROPERTIES
         VS_DEBUGGER_WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     )
 endif()
@@ -54,15 +63,20 @@ if(WIN32)
     if(MSVC)
         # Enable parallel compilation
         target_compile_options(test_program PRIVATE /MP)
+        target_compile_options(test_program_with_args PRIVATE /MP)
         
         # Set subsystem to console
         set_target_properties(test_program PROPERTIES
+            LINK_FLAGS "/SUBSYSTEM:CONSOLE"
+        )
+        set_target_properties(test_program_with_args PROPERTIES
             LINK_FLAGS "/SUBSYSTEM:CONSOLE"
         )
     endif()
 else()
     # Linux/Unix settings
     target_link_libraries(test_program PRIVATE pthread)
+    target_link_libraries(test_program_with_args PRIVATE pthread)
 endif()
 
 # Custom target for cleaning intermediate files
@@ -70,11 +84,19 @@ add_custom_target(clean-intermediate
     COMMAND ${CMAKE_COMMAND} -E remove -f
         ${CMAKE_CURRENT_BINARY_DIR}/test_program.obj
         ${CMAKE_CURRENT_BINARY_DIR}/test_program.ilk
+        ${CMAKE_CURRENT_BINARY_DIR}/test_program_with_args.obj
+        ${CMAKE_CURRENT_BINARY_DIR}/test_program_with_args.ilk
     COMMENT "Cleaning intermediate files"
 )
 
 # Add dependency to clean intermediate files after build
 add_custom_command(TARGET test_program POST_BUILD
+    COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target clean-intermediate
+    COMMENT "Cleaning up intermediate files"
+    VERBATIM
+)
+
+add_custom_command(TARGET test_program_with_args POST_BUILD
     COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target clean-intermediate
     COMMENT "Cleaning up intermediate files"
     VERBATIM
@@ -87,7 +109,7 @@ message(STATUS "C++ standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "Compiler: ${CMAKE_CXX_COMPILER_ID}")
 
 # Add install target (optional)
-install(TARGETS test_program
+install(TARGETS test_program test_program_with_args
     RUNTIME DESTINATION bin
     COMPONENT Runtime
 )
