@@ -3,13 +3,17 @@
 #include <string>
 
 int fibonacci(int n) {
+    bool printN = false;
     if (n <= 1) {
         return n;
+    }
+    if(printN) {
+        std::cout << std::to_string(n) << std::endl;
     }
     return fibonacci(n - 1) + fibonacci(n - 2);
 }
 
-int main() {
+int main(int argc, char** argv) {
     std::cout << "C++ Debug Test Program" << std::endl;
     
     // Test variables of different types

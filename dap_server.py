@@ -360,8 +360,6 @@ class SocketDAPServer:
         # the initial loader breakpoint to main entry point
         if self.debugger and self.is_running:
             try:
-                logger.info("Moving debugger from loader breakpoint to main entry...")
-                self.debugger.go_to_main_entry()
                 logger.info("Debugger positioned, checking if we need to send stopped event")
                 
                 # After go_to_main_entry(), the debugger should be stopped at main or at a user breakpoint

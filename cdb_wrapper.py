@@ -69,7 +69,10 @@ class CdbOutputParser:
     # Regex patterns for parsing CDB output
     BREAKPOINT_PATTERN = re.compile(r'^\s*(\d+):\s+([0-9a-f`]+)\s+.*?(@#\d+)?\s*(.*)$', re.MULTILINE)
     STACK_FRAME_PATTERN = re.compile(r'^(\d+)\s+([0-9a-f`]+)\s+([0-9a-f`]+)\s+(.+?)(?:\s+\[(.+?)\s+@\s+(\d+)\])?$', re.MULTILINE)
-    VARIABLE_PATTERN = re.compile(r'^([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+?)(?:\s+\[Type:\s+(.+?)\])?$', re.MULTILINE)
+    VARIABLE_PATTERN = re.compile(
+        r'^prv\s+(\w+)\s+([\w\s\*\[\]]+)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$',
+        re.MULTILINE
+    )
     THREAD_PATTERN = re.compile(r'^\s*(\d+)\s+Id:\s+([0-9a-f.]+)\s+Suspend:\s+(\d+)\s+Teb:\s+([0-9a-f`]+)\s+(.*)$', re.MULTILINE)
 
     @classmethod
@@ -143,18 +146,22 @@ class CdbOutputParser:
         return frames
 
     @classmethod
-    def parse_variables(cls, output: str) -> List[CdbVariable]:
+    def parse_variables(cls, output: str, kind_filter: Optional[str] = None) -> List[CdbVariable]:
         """Parse variable list output"""
         variables = []
+
         matches = cls.VARIABLE_PATTERN.findall(output)
 
         for match in matches:
-            name, value, var_type = match
-            variables.append(CdbVariable(
-                name=name,
-                value=value,
-                type=var_type or "unknown"
-            ))
+            kind, var_type, name, value = match
+            # kind in cdb is one of "local", "param" or "global"
+            if kind_filter is not None and kind == kind_filter:
+                # only append if kind matches filter
+                variables.append(CdbVariable(
+                    name=name,
+                    value=value,
+                    type=var_type or "unknown"
+                ))
 
         return variables
 
@@ -207,8 +214,12 @@ class CdbCommunicator:
             
             logger.info(f"Found cdb.exe at: {cdb_path}")
 
-            # Don't use -g flag, we want to stop at initial breakpoint to allow setup
-            cdb_command = ['cdb.exe', '-G', '-cf', '-cfr']
+
+            # Add -y <exe_folder> to symbol search path
+            exe_folder = os.path.dirname(os.path.abspath(program))
+            # make sure the folder is ending with a double backslash
+            exe_folder += '\\'
+            cdb_command = ['cdb.exe', '-G', f'-y', exe_folder]
             cdb_command.append(program)
             if args:
                 cdb_command.extend(args)
@@ -237,25 +248,28 @@ class CdbCommunicator:
             if self.process.poll() is not None:
                 logger.error(f"CDB process exited immediately with return code: {self.process.poll()}")
                 return False
+            
+            # force (re)load symbols, as Cdb does not automatically do this
+            self.send_command(".reload /f")  # Force reload symbols
 
             # Send initial setup commands
             logger.info("Sending initial setup commands...")
             self.send_command(".echo Setting up debugger...")
-            self.send_command(".symopt+0x100")  # Enable source line support
-            
-            # Check symbol and source line availability
-            logger.info("Checking debug symbol availability...")
-            sym_output = self.send_command("lm vm VisionSym*")  # List modules with verbose info
-            logger.info(f"Symbol info: {sym_output}")
-            
-            # Try to load symbols if needed
-            self.send_command(".reload /f")  # Force reload symbols
+            self.send_command(".lines")  # Enable source line support
+
+            # Cdb stops at entry, but this entry means nothing to the user
+            # instead, break at main. TODO: only break at main if specified by the user!
+            self.send_command("bp main")
+            self.send_command("g")
             
             # We're now stopped at the initial loader breakpoint
             # Get the initial stack trace to see where we are
             logger.info("Getting initial stack trace to verify position...")
             stack_output = self.send_command("k")
             logger.info(f"Initial stack: {stack_output}")
+
+            vars = self.send_command("dv /i /t")
+            logger.info(f"{vars}")
 
             logger.info(f"Successfully started CDB process for program: {program}")
             logger.info("Debugger is stopped at initial breakpoint, ready for DAP setup")
@@ -386,11 +400,18 @@ class CdbCommunicator:
             return ""
 
     def get_unsolicited_output(self) -> Optional[str]:
-        """Get any unsolicited output from CDB"""
+        """Get any unsolicited output from CDB, concatenating all available chunks."""
+        chunks = []
         try:
-            return self.output_queue.get_nowait()
+            while True:
+                chunk = self.output_queue.get_nowait()
+                if chunk:
+                    chunks.append(chunk)
         except queue.Empty:
-            return None
+            pass
+        if chunks:
+            return ''.join(chunks)
+        return None
 
     def terminate(self):
         """Terminate CDB process"""
@@ -572,52 +593,14 @@ class EnhancedCdbDebugger:
             logger.error(f"Error sending continue command: {e}")
             self.was_continuing = False
 
-    def go_to_main_entry(self):
-        """Move from initial loader breakpoint to main function entry or first user breakpoint"""
-        logger.info("Moving from loader breakpoint to main entry point...")
-        
-        # Check current stack to confirm we're at loader breakpoint
-        stack_output = self.communicator.send_command("k")
-        logger.info(f"Current stack before going to main: {stack_output}")
-        
-        if "ntdll!" in stack_output and ("Ldr" in stack_output or "DbgBreak" in stack_output):
-            logger.info("Confirmed at loader breakpoint, going to main...")
-            
-            # Instead of setting a temporary main breakpoint, just continue
-            # This will let CDB naturally hit any user breakpoints on the way to main
-            logger.info("Continuing execution to reach main or hit user breakpoints...")
-            self.communicator.send_command("g")
-            
-            # Give it a moment to reach the destination
-            time.sleep(0.5)
-            
-            # Check where we ended up
-            new_stack = self.communicator.send_command("k")
-            logger.info(f"Stack after continuing: {new_stack}")
-            
-            # Check if we hit a user breakpoint or reached main
-            bl_output = self.communicator.send_command("bl")
-            logger.info(f"Current breakpoints after continue: {bl_output}")
-            
-            self.is_stopped = True  # Mark as stopped wherever we ended up
-        else:
-            logger.info("Not at loader breakpoint, skipping go-to-main")
-    
     def get_current_location(self) -> Tuple[Optional[str], int]:
         """Get current source file and line number"""
         try:
             logger.debug("Getting current location...")
-            
-            # Enable line number information first
-            self.communicator.send_command(".lines -e")
-            
+        
             # Get stack frame with source info - this is most reliable
             frame_output = self.communicator.send_command("k 1")
             logger.debug(f"Frame output: {frame_output}")
-            
-            # Get ln output as backup
-            ln_output = self.communicator.send_command("ln .")
-            logger.debug(f"List nearest output: {ln_output}")
             
             import re
             
@@ -631,16 +614,6 @@ class EnhancedCdbDebugger:
                     logger.info(f"Found location via frame output: {file_path}:{line_num}")
                     return file_path, line_num
             
-            # Try to parse ln output as backup
-            # Format: "C:\path\file.ext(line)"
-            if ln_output:
-                match = re.search(r'([a-zA-Z]:[^(]+\.(?:cpp|cxx|c|h|hpp))\((\d+)\)', ln_output)
-                if match:
-                    file_path = match.group(1).strip()
-                    line_num = int(match.group(2))
-                    logger.info(f"Found location via ln output: {file_path}:{line_num}")
-                    return file_path, line_num
-            
             logger.warning("Could not determine current location from CDB output")
             logger.debug(f"Frame output was: {repr(frame_output)}")
             logger.debug(f"LN output was: {repr(ln_output)}")
@@ -652,15 +625,10 @@ class EnhancedCdbDebugger:
             logger.error(f"Traceback: {traceback.format_exc()}")
             return None, 0
 
-    def _step_until_line_changes(self, step_command, fallback_command, operation_name):
+    def _step_until_line_changes(self, step_command, operation_name):
         """Helper method to step until we reach a different source line"""
         current_file, current_line = self.get_current_location()
         logger.debug(f"{operation_name} starting from {current_file}:{current_line}")
-        
-        if not current_file or current_line <= 0:
-            logger.debug(f"Could not get current location, using fallback {fallback_command}")
-            self.communicator.send_command(fallback_command)
-            return
         
         max_steps = 50  # Safety limit to prevent infinite loops
         for step_count in range(1, max_steps + 1):
@@ -682,12 +650,12 @@ class EnhancedCdbDebugger:
     def step_over(self):
         """Step over until we reach a different source line"""
         self.was_stepping = True
-        self._step_until_line_changes('p', 'pc', 'Step over')
+        self._step_until_line_changes('pct', 'Step over')
 
     def step_into(self):
         """Step into until we reach a different source line"""
         self.was_stepping = True
-        self._step_until_line_changes('t', 'tc', 'Step into')
+        self._step_until_line_changes('tct', 'Step into')
 
     def step_out(self):
         """Step out of current function"""
@@ -758,17 +726,31 @@ class EnhancedCdbDebugger:
 
     def get_local_variables(self, frame_id: int = 0) -> List[CdbVariable]:
         """Get local variables for specific frame"""
+
+        # TODO: remove this once everything works
+        trace = self.communicator.send_command('kn')
+        logger.debug(f"Stack trace for local variables: {trace}")
+
         # Switch to specific frame if needed
         if frame_id > 0:
             self.communicator.send_command(f'.frame {frame_id}')
 
-        response = self.communicator.send_command('dv /t /v')
+        response = self.communicator.send_command('dv /i /t')
+        if response == '> ':
+            logger.warning("No local variables returned from CDB")
+            response = unsolicited = self.communicator.get_unsolicited_output() or ''
+            logger.debug(f"Unsolicited output for locals: {repr(unsolicited)}")
 
         # Switch back to frame 0
         if frame_id > 0:
             self.communicator.send_command('.frame 0')
 
-        return self.parser.parse_variables(response)
+        variables = self.parser.parse_variables(response, "local")
+
+        print("Local variables:")
+        print(variables)
+
+        return variables
 
     def get_arguments(self, frame_id: int = 0) -> List[CdbVariable]:
         """Get function arguments for specific frame"""
@@ -776,20 +758,19 @@ class EnhancedCdbDebugger:
         if frame_id > 0:
             self.communicator.send_command(f'.frame {frame_id}')
 
-        # Get function parameters
-        # include parameters
-        response = self.communicator.send_command('dv /t /v /i')
+        response = self.communicator.send_command('dv /i /t')
 
         # Switch back to frame 0
         if frame_id > 0:
             self.communicator.send_command('.frame 0')
 
         # Filter for parameters only (this is a simplified approach)
-        variables = self.parser.parse_variables(response)
-        # In a real implementation,
-        # you'd distinguish between locals and parameters
-        # Return first 2 as "arguments"
-        return variables[:2] if variables else []
+        variables = self.parser.parse_variables(response, "param")
+
+        print("Function arguments:")
+        print(variables)
+
+        return variables
 
     def stop(self):
         """Stop the debugger (alias for terminate)"""
