@@ -80,8 +80,9 @@ class CdbOutputParser:
     BREAKPOINT_PATTERN = re.compile(r'^\s*(\d+):\s+([0-9a-f`]+)\s+.*?(@#\d+)?\s*(.*)$', re.MULTILINE)
     STACK_FRAME_PATTERN = re.compile(r'^(\d+)\s+([0-9a-f`]+)\s+([0-9a-f`]+)\s+(.+?)(?:\s+\[(.+?)\s+@\s+(\d+)\])?$', re.MULTILINE)
     # Extended variable pattern: allow angle brackets, commas, colons for C++ template types
+    # Allow optional leading whitespace to handle indented output
     VARIABLE_PATTERN = re.compile(
-        r'^prv\s+(\w+)\s+([\w\s\*\[\]<>:,]+)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$',
+        r'^\s*prv\s+(\w+)\s+([\w\s\*\[\]<>:,]+)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$',
         re.MULTILINE
     )
     # Secondary simple assignment pattern (lines without 'prv' prefix)
