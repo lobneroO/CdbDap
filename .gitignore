@@ -9,4 +9,5 @@ env/
 
 vc140.pdb
 
+cdb_interaction.log
 socket_dap_debug.log

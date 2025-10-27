@@ -27,15 +27,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configure GDB interaction logger
-gdb_log_file = os.path.join(os.path.dirname(__file__), 'gdb_interaction.log')
-gdb_logger = logging.getLogger('gdb_interaction')
-gdb_logger.setLevel(logging.DEBUG)
-gdb_handler = logging.FileHandler(gdb_log_file, mode='a')
-gdb_formatter = logging.Formatter('%(asctime)s - %(message)s')
-gdb_handler.setFormatter(gdb_formatter)
-gdb_logger.addHandler(gdb_handler)
-gdb_logger.propagate = False  # Don't propagate to root logger
+# Configure CDB interaction logger
+cdb_log_file = os.path.join(os.path.dirname(__file__), 'cdb_interaction.log')
+cdb_logger = logging.getLogger('cdb_interaction')
+cdb_logger.setLevel(logging.DEBUG)
+cdb_handler = logging.FileHandler(cdb_log_file, mode='a')
+cdb_formatter = logging.Formatter('%(asctime)s - %(message)s')
+cdb_handler.setFormatter(cdb_formatter)
+cdb_logger.addHandler(cdb_handler)
+cdb_logger.propagate = False  # Don't propagate to root logger
 
 
 @dataclass
@@ -373,8 +373,8 @@ class CdbCommunicator:
                     else:
                         # Unsolicited output (e.g., breakpoint hit)
                         logger.debug(f"Unsolicited output with prompt: {repr(buffer[:100])}")
-                        # Log GDB interaction - unsolicited output
-                        gdb_logger.info(f"UNSOLICITED: {buffer.strip()}")
+                        # Log CDB interaction - unsolicited output
+                        cdb_logger.info(f"UNSOLICITED: {buffer.strip()}")
                         self.output_queue.put(buffer)
                         buffer = ""
                 
@@ -384,8 +384,8 @@ class CdbCommunicator:
                     if (('Breakpoint' in buffer or 'breakpoint' in buffer.lower()) and 
                           len(buffer) > 10):
                         logger.info(f"Detected explicit breakpoint message: {repr(buffer[:200])}")
-                        # Log GDB interaction - breakpoint message
-                        gdb_logger.info(f"BREAKPOINT: {buffer.strip()}")
+                        # Log CDB interaction - breakpoint message
+                        cdb_logger.info(f"BREAKPOINT: {buffer.strip()}")
                         self.output_queue.put(buffer)
                         buffer = ""
                     
@@ -393,8 +393,8 @@ class CdbCommunicator:
                     elif (('Break instruction exception' in buffer or 
                            'stopped at' in buffer.lower()) and len(buffer) > 50):
                         logger.info(f"Detected break event: {repr(buffer[:100])}")
-                        # Log GDB interaction - break event
-                        gdb_logger.info(f"BREAK_EVENT: {buffer.strip()}")
+                        # Log CDB interaction - break event
+                        cdb_logger.info(f"BREAK_EVENT: {buffer.strip()}")
                         self.output_queue.put(buffer)
                         buffer = ""
                     
@@ -424,8 +424,8 @@ class CdbCommunicator:
             self.command_event.clear()
 
             logger.debug(f"Sending CDB command: {command}")
-            # Log GDB interaction - input command
-            gdb_logger.info(f"INPUT: {command}")
+            # Log CDB interaction - input command
+            cdb_logger.info(f"INPUT: {command}")
             self.process.stdin.write(command + '\n')
             self.process.stdin.flush()
 
@@ -434,8 +434,8 @@ class CdbCommunicator:
                 response = self.command_response
                 self.current_command = None
                 logger.debug(f"Command '{command}' response: {repr(response[:200])}")
-                # Log GDB interaction - output response
-                gdb_logger.info(f"OUTPUT: {response.strip()}")
+                # Log CDB interaction - output response
+                cdb_logger.info(f"OUTPUT: {response.strip()}")
                 return response
             else:
                 logger.warning(f"Command timeout: {command}")
