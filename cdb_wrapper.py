@@ -362,11 +362,12 @@ class CdbCommunicator:
 
                 buffer += char
 
-                # Check for command prompt
-                if (buffer.endswith('0:000> ') or #  buffer.endswith('> ') or 
-                    buffer.endswith('0:000>') or buffer.rstrip().endswith('0:000>')):
+                # Check for command prompt (any thread ID format: 0:000>, 1:000>, etc.)
+                prompt_match = re.search(r'(\d+:\d+>)\s*$', buffer)
+                if prompt_match:
+                    prompt = prompt_match.group(1)
                     if self.current_command:
-                        self.command_response = buffer
+                        self.command_response = buffer.rstrip().removesuffix(prompt)
                         self.command_event.set()
                         buffer = ""
                     else:
