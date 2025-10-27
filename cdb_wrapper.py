@@ -310,6 +310,9 @@ class CdbCommunicator:
             self.send_command(".reload /f")
             # Enable source line support
             self.send_command('.lines -e')
+            # enable source line stepping (otherwise, stepping command
+            # in cdb will do assembly instruction stepping)
+            self.send_command('l+t')
 
             # Cdb stops at entry, but this entry means nothing to the user
             # instead, break at main.
@@ -753,12 +756,14 @@ class EnhancedCdbDebugger:
     def step_over(self):
         """Step over until we reach a different source line"""
         self.was_stepping = True
-        self._step_until_line_changes('pct', 'Step over')
+        self.communicator.send_command('p')
+        # self._step_until_line_changes('pct', 'Step over')
 
     def step_into(self):
         """Step into until we reach a different source line"""
         self.was_stepping = True
-        self._step_until_line_changes('tct', 'Step into')
+        self.communicator.send_command('t')
+        # self._step_until_line_changes('tct', 'Step into')
 
     def step_out(self):
         """Step out of current function"""
