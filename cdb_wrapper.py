@@ -295,7 +295,7 @@ class CdbCommunicator:
             # force (re)load symbols, as Cdb does not automatically do this
             self.send_command(".reload /f")
             # Enable source line support
-            self.send_command(".lines")
+            self.send_command('.lines -e')
 
             # Cdb stops at entry, but this entry means nothing to the user
             # instead, break at main. TODO: only break at main if specified by the user!
@@ -658,8 +658,6 @@ class EnhancedCdbDebugger:
             logger.debug(f"Frame output: {frame_output}")
             
             import re
-            
-            # Try to parse frame output first (most reliable after .lines -e)
             # Format: "VisionSym!main [C:\Users\...\main.cxx @ 281]"
             if frame_output:
                 match = re.search(r'\[([^@]+)\s*@\s*(\d+)\]', frame_output)
@@ -727,9 +725,6 @@ class EnhancedCdbDebugger:
         """Get current stack trace"""
         if thread_id and thread_id != self.current_thread_id:
             self.switch_thread(thread_id)
-
-        # Enable line number information first
-        self.communicator.send_command(".lines -e")
         
         # Use kn (numbered stack) for parsing - it has the frame numbers that the parser expects
         response = self.communicator.send_command('kn')
@@ -785,9 +780,6 @@ class EnhancedCdbDebugger:
         if frame_id > 0:
             self.communicator.send_command(f'.frame {frame_id}')
 
-        # Ensure line info is enabled for richer dv output
-        self.communicator.send_command('.lines -e')
-
         # Send dv and then poll for additional unsolicited chunks to build complete output
         raw = self.communicator.send_command('dv /i /t')
         logger.debug(f"Raw dv /i /t response: {repr(raw)}")
@@ -829,7 +821,6 @@ class EnhancedCdbDebugger:
         """Get function arguments for specific frame"""
         if frame_id > 0:
             self.communicator.send_command(f'.frame {frame_id}')
-        self.communicator.send_command('.lines -e')
         raw = self.communicator.send_command('dv /i /t')
         combined = raw
         poll_start = time.time()
