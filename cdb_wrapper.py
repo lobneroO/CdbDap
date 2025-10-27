@@ -763,6 +763,10 @@ class EnhancedCdbDebugger:
     def step_into(self):
         """Step into until we reach a different source line"""
         self.was_stepping = True
+        # stepping into will call an assembly jmp, but not
+        # immediately move to the source line inside the function.
+        # therefore, step into twice
+        self.communicator.send_command('t')
         self.communicator.send_command('t')
         # self._step_until_line_changes('tct', 'Step into')
 
