@@ -680,6 +680,7 @@ class EnhancedCdbDebugger:
         """Continue program execution"""
         self.is_stopped = False
         self.was_continuing = True  # Flag to help detect breakpoint hits
+        self.was_stepping = False
         logger.info("Continuing execution...")
 
         # Don't use timeout for continue - let it run until breakpoint/event
