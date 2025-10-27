@@ -552,17 +552,12 @@ class EnhancedCdbDebugger:
         # Try different CDB breakpoint syntax variations
         commands_to_try = [
             f'bp `{file_path}:{line}`',  # Standard syntax with backticks
-            f'bp "{file_path}:{line}"',  # With quotes
-            f'bm {file_path}:{line}',    # Different breakpoint command
+            # f'bp "{file_path}:{line}"',  # With quotes
+            # f'bm {file_path}:{line}',    # Different breakpoint command
         ]
 
         verified = False
         response = ""
-
-        for i, command in enumerate(commands_to_try):
-            logger.info(f"Trying breakpoint command #{i+1}: {command}")
-            response = self.communicator.send_command(command)
-            logger.info(f"Breakpoint response: {repr(response)}")
 
         for i, command in enumerate(commands_to_try):
             logger.info(f"Trying breakpoint command #{i+1}: {command}")
