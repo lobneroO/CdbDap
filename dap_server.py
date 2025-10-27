@@ -414,12 +414,49 @@ class SocketDAPServer:
             logger.error(f"Error in handle_continue: {e}")
             self.send_response(request['seq'], 'continue', False, str(e))
 
+    def _send_step_stopped_event(self):
+        """Send stopped event after step operation"""
+        try:
+            file_path, line_num = self.debugger.get_current_location()
+            logger.info(f"Step completed at {file_path}:{line_num}")
+            
+            stopped_body = {
+                'reason': 'step',
+                'threadId': 1,  # or self.debugger.current_thread_id
+                'allThreadsStopped': True
+            }
+            
+            if file_path and line_num > 0:
+                stopped_body['source'] = {
+                    'name': os.path.basename(file_path),
+                    'path': file_path
+                }
+                stopped_body['line'] = line_num
+                stopped_body['column'] = 1
+            
+            self.send_event('stopped', stopped_body)
+            logger.info(f"Sent step stopped event for {file_path}:{line_num}")
+            
+        except Exception as e:
+            logger.error(f"Error sending step stopped event: {e}")
+            # Send basic stopped event as fallback
+            self.send_event('stopped', {
+                'reason': 'step',
+                'threadId': 1,
+                'allThreadsStopped': True
+            })
+
     def handle_next(self, request: Dict[str, Any]):
         """Handle next (step over) request"""
         logger.info("Handling next request")
         try:
             self.debugger.step_over()
             self.send_response(request['seq'], 'next')
+
+            # Send stopped event after stepping
+            import time
+            time.sleep(0.1)  # Brief pause to let CDB settle
+            self._send_step_stopped_event()
         except Exception as e:
             logger.error(f"Error in handle_next: {e}")
             self.send_response(request['seq'], 'next', False, str(e))
@@ -430,6 +467,11 @@ class SocketDAPServer:
         try:
             self.debugger.step_into()
             self.send_response(request['seq'], 'stepIn')
+
+            # Send stopped event after stepping
+            import time
+            time.sleep(0.1)  # Brief pause to let CDB settle
+            self._send_step_stopped_event()
         except Exception as e:
             logger.error(f"Error in handle_step_in: {e}")
             self.send_response(request['seq'], 'stepIn', False, str(e))
@@ -440,6 +482,11 @@ class SocketDAPServer:
         try:
             self.debugger.step_out()
             self.send_response(request['seq'], 'stepOut')
+            
+            # Send stopped event after stepping
+            import time
+            time.sleep(0.1)  # Brief pause to let CDB settle
+            self._send_step_stopped_event()
         except Exception as e:
             logger.error(f"Error in handle_step_out: {e}")
             self.send_response(request['seq'], 'stepOut', False, str(e))
