@@ -5,15 +5,11 @@ Socket-based DAP server with file-based port communication
 
 import sys
 import json
-import threading
-import subprocess
-import re
 import os
 import logging
 import socket
-import time
 import signal
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, Any, Optional
 from dataclasses import dataclass, asdict
 
 # Configure logging
@@ -31,7 +27,7 @@ logger = logging.getLogger(__name__)
 logger.info("Socket DAP Server starting up...")
 
 try:
-    from cdb_wrapper import EnhancedCdbDebugger, CdbFrame, CdbVariable, CdbThread
+    from cdb_wrapper import EnhancedCdbDebugger
     logger.info("Successfully imported CDB wrapper")
 except ImportError as e:
     logger.error(f"Failed to import CDB wrapper: {e}")
@@ -39,11 +35,13 @@ except ImportError as e:
 
 # ... (include all the dataclass definitions from your original file) ...
 
+
 @dataclass
 class Source:
     name: Optional[str] = None
     path: Optional[str] = None
     sourceReference: Optional[int] = None
+
 
 @dataclass
 class Breakpoint:
@@ -53,6 +51,7 @@ class Breakpoint:
     source: Optional[Source] = None
     message: Optional[str] = None
 
+
 @dataclass
 class StackFrame:
     id: int
@@ -61,10 +60,12 @@ class StackFrame:
     column: int
     source: Optional[Source] = None
 
+
 @dataclass
 class Thread:
     id: int
     name: str
+
 
 @dataclass
 class Variable:
@@ -72,6 +73,7 @@ class Variable:
     value: str
     type: Optional[str] = None
     variablesReference: int = 0
+
 
 class SocketDAPServer:
     """Socket-based Debug Adapter Protocol Server"""
@@ -83,10 +85,10 @@ class SocketDAPServer:
         self.socket = None
         self.client_socket = None
         self.running = True
-        
+
         # Map breakpoint IDs to their source locations
         self.breakpoint_locations = {}  # bp_id -> (file_path, line)
-        
+
         try:
             self.debugger = EnhancedCdbDebugger()
             logger.info("Successfully created CDB debugger instance")
@@ -137,7 +139,7 @@ class SocketDAPServer:
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.socket.settimeout(1.0)  # Add timeout for accept()
-        
+
         # Bind to localhost with automatic port selection if port=0
         # TODO: for testing, just use 13000 like lldb does
         self.port = 13000
@@ -149,7 +151,8 @@ class SocketDAPServer:
         logger.info(f"Socket DAP Server listening on port {self.port}")
 
         # Write port to file for client to read
-        port_file = os.path.join(os.path.dirname(__file__), 'dap_server_port.txt')
+        port_file = os.path.join(os.path.dirname(__file__),
+                                 'dap_server_port.txt')
         try:
             with open(port_file, 'w') as f:
                 f.write(str(self.port))
@@ -166,7 +169,7 @@ class SocketDAPServer:
     def wait_for_connection(self):
         """Wait for client connection with timeout"""
         logger.info("Waiting for client connection...")
-        
+
         while self.running:
             try:
                 self.client_socket, client_address = self.socket.accept()
@@ -193,7 +196,7 @@ class SocketDAPServer:
             content = json.dumps(message, separators=(',', ':'))
             headers = f'Content-Length: {len(content)}\r\n\r\n'
             output = headers + content
-            
+
             self.client_socket.send(output.encode('utf-8'))
             logger.debug(f"Sent message: {message}")
         except Exception as e:
@@ -249,7 +252,8 @@ class SocketDAPServer:
         """Handle disconnect request"""
         logger.info("Handling disconnect request")
         self.is_running = False
-        self.running = False  # Stop the main loop
+        # Stop the main loop by setting running to False
+        self.running = False
         if self.debugger:
             try:
                 self.debugger.stop()
@@ -260,8 +264,9 @@ class SocketDAPServer:
     def handle_launch(self, request: Dict[str, Any]):
         """Handle launch request"""
         logger.info("Handling launch request")
-        logger.info(f"Launch request arguments: {request.get('arguments', {})}")
-        
+        logger.info("Launch request arguments: "
+                    f"{request.get('arguments', {})}")
+
         args = request.get('arguments', {})
         program = args.get('program')
 
@@ -273,7 +278,7 @@ class SocketDAPServer:
             return
 
         logger.info(f"Attempting to launch program: {program}")
-        
+
         # Convert relative path to absolute if needed
         if not os.path.isabs(program):
             cwd = args.get('cwd', os.getcwd())
@@ -289,11 +294,14 @@ class SocketDAPServer:
 
             if success:
                 self.is_running = True
-                logger.info("Debugger started successfully, sending launch response")
+                logger.info("Debugger started successfully, "
+                            "sending launch response")
                 self.send_response(request['seq'], 'launch')
-                # Don't send stopped event here - we'll send it after configurationDone
+                # Don't send stopped event here,
+                # we'll send it after configurationDone
                 # when we've moved from loader breakpoint to main
-                logger.info("Waiting for configurationDone to move to main entry point")
+                logger.info("Waiting for configurationDone to move "
+                            "to main entry point")
             else:
                 error_msg = f'Failed to start debugger for program: {program}'
                 logger.error(error_msg)
@@ -315,7 +323,8 @@ class SocketDAPServer:
         breakpoints = args.get('breakpoints', [])
 
         if not file_path:
-            self.send_response(request['seq'], 'setBreakpoints', False, 'No file path provided')
+            self.send_response(request['seq'], 'setBreakpoints', False,
+                               'No file path provided')
             return
 
         try:
@@ -327,21 +336,25 @@ class SocketDAPServer:
                         bp_id = self.debugger.set_breakpoint(file_path, line)
                         # Store breakpoint location for later reference
                         self.breakpoint_locations[bp_id] = (file_path, line)
-                        logger.info(f"Stored breakpoint {bp_id} at {file_path}:{line}")
-                        
+                        logger.info("Stored breakpoint {bp_id} at "
+                                    f"{file_path}:{line}")
+
                         result_breakpoints.append(Breakpoint(
                             id=bp_id,
                             verified=True,
                             line=line,
-                            source=Source(path=file_path, name=os.path.basename(file_path))
+                            source=Source(path=file_path,
+                                          name=os.path.basename(file_path))
                         ))
                     except Exception as e:
-                        logger.error(f"Failed to set breakpoint at {file_path}:{line}: {e}")
+                        logger.error("Failed to set breakpoint at "
+                                     f"{file_path}:{line}: {e}")
                         result_breakpoints.append(Breakpoint(
                             id=0,
                             verified=False,
                             line=line,
-                            source=Source(path=file_path, name=os.path.basename(file_path)),
+                            source=Source(path=file_path,
+                                          name=os.path.basename(file_path)),
                             message=str(e)
                         ))
 
@@ -355,14 +368,21 @@ class SocketDAPServer:
     def handle_configuration_done(self, request: Dict[str, Any]):
         """Handle configurationDone request"""
         logger.info("Handling configurationDone request")
-        # Lightweight: acknowledge configuration and emit a single stopped event for current position.
+        # Lightweight: acknowledge configuration and
+        # emit a single stopped event for current position.
         if self.debugger and self.is_running and self.debugger.is_stopped:
             try:
                 file_path, line_num = self.debugger.get_current_location()
-                logger.info(f"configurationDone current location: {file_path}:{line_num}")
+                logger.info("configurationDone current location: "
+                            f"{file_path}:{line_num}")
                 reason = 'entry'
-                for bp_id, (bp_file, bp_line) in self.breakpoint_locations.items():
-                    if file_path and bp_file and file_path.lower().endswith(os.path.basename(bp_file).lower()) and bp_line == line_num:
+                for bp_id, (bp_file, bp_line) \
+                        in self.breakpoint_locations.items():
+                    if (file_path
+                            and bp_file
+                            and file_path.lower().endswith(
+                                os.path.basename(bp_file).lower())
+                            and bp_line == line_num):
                         reason = 'breakpoint'
                         break
                 stopped_event = {
@@ -379,16 +399,17 @@ class SocketDAPServer:
                     stopped_event['column'] = 1
                 self.send_event('stopped', stopped_event)
             except Exception as e:
-                logger.error(f"Error fetching current location in configurationDone: {e}")
+                logger.error("Error fetching current location "
+                             f"in configurationDone: {e}")
         self.send_response(request['seq'], 'configurationDone')
 
-    # Restored handler functions (lost in previous patch) --------------------
     def handle_continue(self, request: Dict[str, Any]):
         """Handle continue request"""
         logger.info("Handling continue request")
         try:
             self.debugger.continue_execution()
-            self.send_response(request['seq'], 'continue', body={'allThreadsContinued': True})
+            self.send_response(request['seq'], 'continue',
+                               body={'allThreadsContinued': True})
         except Exception as e:
             logger.error(f"Error in handle_continue: {e}")
             self.send_response(request['seq'], 'continue', False, str(e))
@@ -466,7 +487,8 @@ class SocketDAPServer:
                     column=0,
                     source=Source(
                         path=frame.file,
-                        name=os.path.basename(frame.file) if frame.file else None
+                        name=os.path.basename(frame.file)
+                        if frame.file else None
                     ) if frame.file else None
                 ))
 
@@ -484,8 +506,12 @@ class SocketDAPServer:
         frame_id = args.get('frameId', 0)
 
         scopes = [
-            {'name': 'Locals', 'variablesReference': 1000 + frame_id, 'expensive': False},
-            {'name': 'Arguments', 'variablesReference': 2000 + frame_id, 'expensive': False}
+            {'name': 'Locals',
+             'variablesReference': 1000 + frame_id,
+             'expensive': False},
+            {'name': 'Arguments',
+             'variablesReference': 2000 + frame_id,
+             'expensive': False}
         ]
 
         self.send_response(request['seq'], 'scopes', body={'scopes': scopes})
@@ -520,7 +546,8 @@ class SocketDAPServer:
             })
         except Exception as e:
             logger.error(f"Error getting variables: {e}")
-            self.send_response(request['seq'], 'variables', body={'variables': []})
+            self.send_response(request['seq'], 'variables',
+                               body={'variables': []})
 
     def handle_evaluate(self, request: Dict[str, Any]):
         """Handle evaluate request"""
@@ -541,7 +568,8 @@ class SocketDAPServer:
     def handle_set_exception_breakpoints(self, request: Dict[str, Any]):
         """Handle setExceptionBreakpoints request (no-op)"""
         logger.info("Handling setExceptionBreakpoints request")
-        # You can implement real exception breakpoints if your debugger supports it.
+        # You can implement real exception breakpoints
+        # if your debugger supports it.
         # For now, just respond with an empty list.
         self.send_response(request['seq'], 'setExceptionBreakpoints', body={
             'breakpoints': []
@@ -559,10 +587,82 @@ class SocketDAPServer:
                 logger.error(f"Error terminating debugger: {e}")
         self.send_response(request['seq'], 'terminate')
 
-    def run(self):
-        """Main message loop using socket"""
-        logger.info("Starting Socket DAP Server message loop...")
+    def _on_breakpoint_hit(self, stopped_body):
+        logger.info("No source detected from CDB, checking breakpoint map...")
+        # Try to find which breakpoint was hit by
+        # checking the debugger's breakpoint list
+        try:
+            current_bp_list = self.debugger.list_breakpoints()
+            logger.info("Current breakpoints from debugger: "
+                        f"{current_bp_list}")
 
+            # Look for a breakpoint that matches our stored locations
+            for bp_id, (bp_file, bp_line) in self.breakpoint_locations.items():
+                logger.info(f"Checking stored breakpoint {bp_id}: "
+                            f"{bp_file}:{bp_line}")
+                # For now, use the first breakpoint location as fallback
+                # In a more sophisticated version, we could parse CDB output
+                # to determine exactly which breakpoint was hit
+                if self.breakpoint_locations:
+                    fallback_file, fallback_line = \
+                        next(iter(self.breakpoint_locations.values()))
+                    stopped_body['source'] = {
+                        'name': os.path.basename(fallback_file),
+                        'path': fallback_file
+                    }
+                    stopped_body['line'] = fallback_line
+                    stopped_body['column'] = 1
+                    logger.info(f"Using fallback breakpoint "
+                                f"location: {fallback_file}:{fallback_line}")
+                    break
+        except Exception as fallback_e:
+            logger.error("Error in breakpoint fallback: "
+                         f"{fallback_e}")
+
+    def _run_stopped(self, event):
+        print()
+        # Get current location for the stopped event
+        try:
+            file_path, line_num = \
+                self.debugger.get_current_location()
+            stopped_body = {
+                'reason': event['reason'],
+                'threadId': event['threadId'],
+                'allThreadsStopped': True
+            }
+
+            # Add source location if available
+            if file_path and line_num > 0:
+                stopped_body['source'] = {
+                    'name': os.path.basename(file_path),
+                    'path': file_path
+                }
+                stopped_body['line'] = line_num
+                stopped_body['column'] = 1
+                logger.info("Using detected source location: "
+                            f"{file_path}:{line_num}")
+            else:
+                # Fallback: If we can't get source from CDB
+                # but this is a breakpoint,
+                # try to use our stored breakpoint locations
+                if event['reason'] == 'breakpoint':
+                    self._on_breakpoint_hit(stopped_body)
+
+            self.send_event('stopped', stopped_body)
+        except Exception as e:
+            logger.error("Error getting location "
+                         f"for stopped event: {e}")
+            # Send basic stopped event without location
+            self.send_event('stopped', {
+                'reason': event['reason'],
+                'threadId': event['threadId'],
+                'allThreadsStopped': True
+            })
+
+    def _run_loop(self) -> str:
+        """The code that runs inside the main loop"""
+        print()
+        buffer = b""
         handlers = {
             'initialize': self.handle_initialize,
             'launch': self.handle_launch,
@@ -583,159 +683,129 @@ class SocketDAPServer:
             'setExceptionBreakpoints': self.handle_set_exception_breakpoints,
         }
 
-        buffer = b""
+        try:
+            # Check for debugging events
+            # (breakpoints, exceptions, etc.)
+            if self.debugger and self.is_running:
+                event = self.debugger.check_for_events()
+                if event:
+                    logger.info(f"Debugger event detected: {event}")
+                    if event['type'] == 'stopped':
+                        self._run_stopped(event)
+                    elif event['type'] == 'exited':
+                        self.send_event('exited', {
+                            'exitCode': event['exitCode']
+                        })
+                        self.is_running = False
+
+            # Read data from socket
+            data = self.client_socket.recv(4096)
+            if not data:
+                logger.info("Client disconnected")
+                # TODO: it's a bit ugly to return a string
+                # to handle the outside loop
+                return "break"
+                # break
+
+            buffer += data
+            logger.debug(f"Received {len(data)} bytes, "
+                         f"buffer now {len(buffer)} bytes")
+
+            # Process complete messages in buffer
+            while True:
+                # Look for Content-Length header
+                if b'Content-Length:' not in buffer:
+                    break
+
+                # Find header end
+                header_end = buffer.find(b'\r\n\r\n')
+                if header_end == -1:
+                    break
+
+                # Parse headers
+                header_text = buffer[:header_end].decode('utf-8')
+                content_start = header_end + 4
+
+                content_length = 0
+                for line in header_text.split('\r\n'):
+                    if line.startswith('Content-Length:'):
+                        content_length = \
+                            int(line.split(':', 1)[1].strip())
+                        break
+
+                logger.debug("Parsed Content-Length: "
+                             f"{content_length}")
+
+                # Check if we have complete message
+                if len(buffer) < content_start + content_length:
+                    logger.debug("Need more data: have "
+                                 f"{len(buffer)}, "
+                                 f"need {content_start
+                                         + content_length}")
+                    break
+
+                # Extract content
+                content_bytes = buffer[content_start:content_start
+                                       + content_length]
+                content = content_bytes.decode('utf-8')
+                logger.debug(f"Extracted content: {repr(content)}")
+
+                # Remove processed message from buffer
+                buffer = buffer[content_start + content_length:]
+
+                # Parse and handle JSON
+                try:
+                    request = json.loads(content)
+                    logger.info("*** Successfully parsed request: "
+                                f"{request.get('command', 'unknown')} "
+                                "***")
+
+                    command = request.get('command')
+                    if command in handlers:
+                        logger.info("*** Calling handler for: "
+                                    f"{command} ***")
+                        handlers[command](request)
+                        logger.info("*** Handler completed for: "
+                                    f"{command} ***")
+                    else:
+                        logger.warning(f"Unknown command: {command}")
+                        self.send_response(
+                            request.get('seq', 0),
+                            command or 'unknown',
+                            False,
+                            f"Unknown command: {command}"
+                        )
+
+                except json.JSONDecodeError as e:
+                    logger.error(f"JSON decode error: {e}")
+                    logger.error(f"Content: {repr(content)}")
+                    continue
+
+        except socket.timeout:
+            # Continue the loop, check if we should still be running
+            # continue
+            return "continue"
+        except Exception as e:
+            logger.error(f"Error in socket loop: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            # break
+            return "break"
+
+    def run(self):
+        """Main message loop using socket"""
+        logger.info("Starting Socket DAP Server message loop...")
 
         try:
             logger.info("Reading from socket...")
             self.client_socket.settimeout(1.0)  # Add timeout for recv()
 
             while self.running:
-                try:
-                    # Check for debugging events (breakpoints, exceptions, etc.)
-                    if self.debugger and self.is_running:
-                        event = self.debugger.check_for_events()
-                        if event:
-                            logger.info(f"Debugger event detected: {event}")
-                            if event['type'] == 'stopped':
-                                # Get current location for the stopped event
-                                try:
-                                    file_path, line_num = self.debugger.get_current_location()
-                                    stopped_body = {
-                                        'reason': event['reason'],
-                                        'threadId': event['threadId'],
-                                        'allThreadsStopped': True
-                                    }
-                                    
-                                    # Add source location if available
-                                    if file_path and line_num > 0:
-                                        stopped_body['source'] = {
-                                            'name': os.path.basename(file_path),
-                                            'path': file_path
-                                        }
-                                        stopped_body['line'] = line_num
-                                        stopped_body['column'] = 1
-                                        logger.info(f"Using detected source location: {file_path}:{line_num}")
-                                    else:
-                                        # Fallback: If we can't get source from CDB but this is a breakpoint,
-                                        # try to use our stored breakpoint locations
-                                        if event['reason'] == 'breakpoint':
-                                            logger.info("No source detected from CDB, checking breakpoint map...")
-                                            # Try to find which breakpoint was hit by checking the debugger's breakpoint list
-                                            try:
-                                                current_bp_list = self.debugger.list_breakpoints()
-                                                logger.info(f"Current breakpoints from debugger: {current_bp_list}")
-                                                
-                                                # Look for a breakpoint that matches our stored locations
-                                                for bp_id, (bp_file, bp_line) in self.breakpoint_locations.items():
-                                                    logger.info(f"Checking stored breakpoint {bp_id}: {bp_file}:{bp_line}")
-                                                    # For now, use the first breakpoint location as fallback
-                                                    # In a more sophisticated version, we could parse CDB output
-                                                    # to determine exactly which breakpoint was hit
-                                                    if self.breakpoint_locations:
-                                                        fallback_file, fallback_line = next(iter(self.breakpoint_locations.values()))
-                                                        stopped_body['source'] = {
-                                                            'name': os.path.basename(fallback_file),
-                                                            'path': fallback_file
-                                                        }
-                                                        stopped_body['line'] = fallback_line
-                                                        stopped_body['column'] = 1
-                                                        logger.info(f"Using fallback breakpoint location: {fallback_file}:{fallback_line}")
-                                                        break
-                                            except Exception as fallback_e:
-                                                logger.error(f"Error in breakpoint fallback: {fallback_e}")
-                                    
-                                    self.send_event('stopped', stopped_body)
-                                except Exception as e:
-                                    logger.error(f"Error getting location for stopped event: {e}")
-                                    # Send basic stopped event without location
-                                    self.send_event('stopped', {
-                                        'reason': event['reason'],
-                                        'threadId': event['threadId'],
-                                        'allThreadsStopped': True
-                                    })
-                            elif event['type'] == 'exited':
-                                self.send_event('exited', {
-                                    'exitCode': event['exitCode']
-                                })
-                                self.is_running = False
-
-                    # Read data from socket
-                    data = self.client_socket.recv(4096)
-                    if not data:
-                        logger.info("Client disconnected")
-                        break
-
-                    buffer += data
-                    logger.debug(f"Received {len(data)} bytes, buffer now {len(buffer)} bytes")
-
-                    # Process complete messages in buffer
-                    while True:
-                        # Look for Content-Length header
-                        if b'Content-Length:' not in buffer:
-                            break
-
-                        # Find header end
-                        header_end = buffer.find(b'\r\n\r\n')
-                        if header_end == -1:
-                            break
-
-                        # Parse headers
-                        header_text = buffer[:header_end].decode('utf-8')
-                        content_start = header_end + 4
-
-                        content_length = 0
-                        for line in header_text.split('\r\n'):
-                            if line.startswith('Content-Length:'):
-                                content_length = int(line.split(':', 1)[1].strip())
-                                break
-
-                        logger.debug(f"Parsed Content-Length: {content_length}")
-
-                        # Check if we have complete message
-                        if len(buffer) < content_start + content_length:
-                            logger.debug(f"Need more data: have {len(buffer)}, need {content_start + content_length}")
-                            break
-
-                        # Extract content
-                        content_bytes = buffer[content_start:content_start + content_length]
-                        content = content_bytes.decode('utf-8')
-                        logger.debug(f"Extracted content: {repr(content)}")
-
-                        # Remove processed message from buffer
-                        buffer = buffer[content_start + content_length:]
-
-                        # Parse and handle JSON
-                        try:
-                            request = json.loads(content)
-                            logger.info(f"*** Successfully parsed request: {request.get('command', 'unknown')} ***")
-
-                            command = request.get('command')
-                            if command in handlers:
-                                logger.info(f"*** Calling handler for: {command} ***")
-                                handlers[command](request)
-                                logger.info(f"*** Handler completed for: {command} ***")
-                            else:
-                                logger.warning(f"Unknown command: {command}")
-                                self.send_response(
-                                    request.get('seq', 0),
-                                    command or 'unknown',
-                                    False,
-                                    f"Unknown command: {command}"
-                                )
-
-                        except json.JSONDecodeError as e:
-                            logger.error(f"JSON decode error: {e}")
-                            logger.error(f"Content: {repr(content)}")
-                            continue
-
-                except socket.timeout:
-                    # Continue the loop, check if we should still be running
-                    continue
-                except Exception as e:
-                    logger.error(f"Error in socket loop: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
+                res = self._run_loop()
+                if res == "break":
                     break
+                elif res == "continue":
+                    continue
 
         except Exception as e:
             logger.error(f"Socket server error: {e}")
@@ -753,11 +823,12 @@ class SocketDAPServer:
             self.socket.close()
 
         # Clean up port file
-        port_file = os.path.join(os.path.dirname(__file__), 'dap_server_port.txt')
+        port_file = os.path.join(os.path.dirname(__file__),
+                                 'dap_server_port.txt')
         try:
             if os.path.exists(port_file):
                 os.remove(port_file)
-        except:
+        except Exception:
             pass
 
         logger.info("Socket DAP Server stopped")
@@ -777,7 +848,7 @@ def main():
     server = SocketDAPServer()
 
     try:
-        port = server.start_server()
+        _ = server.start_server()
         if server.wait_for_connection():
             server.run()
     except KeyboardInterrupt:
