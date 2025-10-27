@@ -27,6 +27,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Configure GDB interaction logger
+gdb_log_file = os.path.join(os.path.dirname(__file__), 'gdb_interaction.log')
+gdb_logger = logging.getLogger('gdb_interaction')
+gdb_logger.setLevel(logging.DEBUG)
+gdb_handler = logging.FileHandler(gdb_log_file, mode='a')
+gdb_formatter = logging.Formatter('%(asctime)s - %(message)s')
+gdb_handler.setFormatter(gdb_formatter)
+gdb_logger.addHandler(gdb_handler)
+gdb_logger.propagate = False  # Don't propagate to root logger
+
 
 @dataclass
 class CdbBreakpoint:
@@ -69,9 +79,14 @@ class CdbOutputParser:
     # Regex patterns for parsing CDB output
     BREAKPOINT_PATTERN = re.compile(r'^\s*(\d+):\s+([0-9a-f`]+)\s+.*?(@#\d+)?\s*(.*)$', re.MULTILINE)
     STACK_FRAME_PATTERN = re.compile(r'^(\d+)\s+([0-9a-f`]+)\s+([0-9a-f`]+)\s+(.+?)(?:\s+\[(.+?)\s+@\s+(\d+)\])?$', re.MULTILINE)
+    # Extended variable pattern: allow angle brackets, commas, colons for C++ template types
     VARIABLE_PATTERN = re.compile(
-        r'^prv\s+(\w+)\s+([\w\s\*\[\]]+)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$',
+        r'^prv\s+(\w+)\s+([\w\s\*\[\]<>:,]+)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$',
         re.MULTILINE
+    )
+    # Secondary simple assignment pattern (lines without 'prv' prefix)
+    SIMPLE_ASSIGN_PATTERN = re.compile(
+        r'^([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$'
     )
     THREAD_PATTERN = re.compile(r'^\s*(\d+)\s+Id:\s+([0-9a-f.]+)\s+Suspend:\s+(\d+)\s+Teb:\s+([0-9a-f`]+)\s+(.*)$', re.MULTILINE)
 
@@ -148,20 +163,42 @@ class CdbOutputParser:
     @classmethod
     def parse_variables(cls, output: str, kind_filter: Optional[str] = None) -> List[CdbVariable]:
         """Parse variable list output"""
-        variables = []
+        variables: List[CdbVariable] = []
 
+        # First collect all structured 'prv' variables
         matches = cls.VARIABLE_PATTERN.findall(output)
+        for kind, var_type, name, value in matches:
+            variables.append(CdbVariable(
+                name=name,
+                value=value.strip(),
+                type=var_type.strip() or "unknown"
+            ))
 
-        for match in matches:
-            kind, var_type, name, value = match
-            # kind in cdb is one of "local", "param" or "global"
-            if kind_filter is not None and kind == kind_filter:
-                # only append if kind matches filter
-                variables.append(CdbVariable(
-                    name=name,
-                    value=value,
-                    type=var_type or "unknown"
-                ))
+        # Collect simple assignment lines not already captured
+        seen_names = {v.name for v in variables}
+        for line in output.splitlines():
+            line = line.strip()
+            if not line or line.startswith('prv '):
+                continue
+            if line.endswith('>') and line.count('>') == 1 and line.count('<') >= 1:
+                # Likely an incomplete template type line, skip until merged
+                continue
+            m = cls.SIMPLE_ASSIGN_PATTERN.match(line)
+            if m:
+                name, value = m.groups()
+                if name not in seen_names:
+                    # Infer type heuristically for std::string and vector summaries
+                    inferred_type = "unknown"
+                    if 'basic_string' in value or 'std::string' in value:
+                        inferred_type = 'std::string'
+                    elif 'size=' in value and '{' in value and '}' in value:
+                        inferred_type = 'container'
+                    variables.append(CdbVariable(name=name, value=value.strip(), type=inferred_type))
+
+        # Apply kind filter after collection if provided (retain only filtered names present in structured matches)
+        if kind_filter:
+            filtered_names = {name for kind, var_type, name, value in matches if kind == kind_filter}
+            variables = [v for v in variables if v.name in filtered_names]
 
         return variables
 
@@ -249,13 +286,15 @@ class CdbCommunicator:
                 logger.error(f"CDB process exited immediately with return code: {self.process.poll()}")
                 return False
             
-            # force (re)load symbols, as Cdb does not automatically do this
-            self.send_command(".reload /f")  # Force reload symbols
 
             # Send initial setup commands
             logger.info("Sending initial setup commands...")
             self.send_command(".echo Setting up debugger...")
-            self.send_command(".lines")  # Enable source line support
+            
+            # force (re)load symbols, as Cdb does not automatically do this
+            self.send_command(".reload /f")
+            # Enable source line support
+            self.send_command(".lines")
 
             # Cdb stops at entry, but this entry means nothing to the user
             # instead, break at main. TODO: only break at main if specified by the user!
@@ -323,39 +362,50 @@ class CdbCommunicator:
                 buffer += char
 
                 # Check for command prompt
-                if (buffer.endswith('0:000> ') or buffer.endswith('> ') or 
+                if (buffer.endswith('0:000> ') or #  buffer.endswith('> ') or 
                     buffer.endswith('0:000>') or buffer.rstrip().endswith('0:000>')):
                     if self.current_command:
                         self.command_response = buffer
                         self.command_event.set()
+                        buffer = ""
                     else:
                         # Unsolicited output (e.g., breakpoint hit)
                         logger.debug(f"Unsolicited output with prompt: {repr(buffer[:100])}")
-                        self.output_queue.put(buffer)
-                    buffer = ""
-                
-                # Check for explicit breakpoint messages
-                elif (('Breakpoint' in buffer or 'breakpoint' in buffer.lower()) and 
-                      len(buffer) > 10):
-                    logger.info(f"Detected explicit breakpoint message: {repr(buffer[:200])}")
-                    if not self.current_command:
+                        # Log GDB interaction - unsolicited output
+                        gdb_logger.info(f"UNSOLICITED: {buffer.strip()}")
                         self.output_queue.put(buffer)
                         buffer = ""
                 
-                # Check for other break events
-                elif (('Break instruction exception' in buffer or 
-                       'stopped at' in buffer.lower()) and len(buffer) > 50):
-                    logger.info(f"Detected break event: {repr(buffer[:100])}")
-                    if not self.current_command:
+                # Only process other events if we're not waiting for a command response
+                elif not self.current_command:
+                    # Check for explicit breakpoint messages
+                    if (('Breakpoint' in buffer or 'breakpoint' in buffer.lower()) and 
+                          len(buffer) > 10):
+                        logger.info(f"Detected explicit breakpoint message: {repr(buffer[:200])}")
+                        # Log GDB interaction - breakpoint message
+                        gdb_logger.info(f"BREAKPOINT: {buffer.strip()}")
+                        self.output_queue.put(buffer)
+                        buffer = ""
+                    
+                    # Check for other break events
+                    elif (('Break instruction exception' in buffer or 
+                           'stopped at' in buffer.lower()) and len(buffer) > 50):
+                        logger.info(f"Detected break event: {repr(buffer[:100])}")
+                        # Log GDB interaction - break event
+                        gdb_logger.info(f"BREAK_EVENT: {buffer.strip()}")
+                        self.output_queue.put(buffer)
+                        buffer = ""
+                    
+                    # Check if buffer is getting too long without a prompt
+                    elif len(buffer) > 2000:
+                        logger.debug(f"Buffer getting long, flushing: {repr(buffer[:100])}")
                         self.output_queue.put(buffer)
                         buffer = ""
                 
-                # Check if buffer is getting too long without a prompt
-                elif len(buffer) > 2000:
-                    logger.debug(f"Buffer getting long, flushing: {repr(buffer[:100])}")
-                    if not self.current_command:
-                        self.output_queue.put(buffer)
-                    buffer = ""
+                # If we're waiting for a command response, only check for buffer overflow
+                elif self.current_command and len(buffer) > 5000:
+                    logger.warning(f"Command response buffer getting very long: {len(buffer)} chars")
+                    # Don't clear the buffer, just log the warning
 
             except Exception as e:
                 logger.error(f"Error reading CDB output: {e}")
@@ -372,6 +422,8 @@ class CdbCommunicator:
             self.command_event.clear()
 
             logger.debug(f"Sending CDB command: {command}")
+            # Log GDB interaction - input command
+            gdb_logger.info(f"INPUT: {command}")
             self.process.stdin.write(command + '\n')
             self.process.stdin.flush()
 
@@ -380,6 +432,8 @@ class CdbCommunicator:
                 response = self.command_response
                 self.current_command = None
                 logger.debug(f"Command '{command}' response: {repr(response[:200])}")
+                # Log GDB interaction - output response
+                gdb_logger.info(f"OUTPUT: {response.strip()}")
                 return response
             else:
                 logger.warning(f"Command timeout: {command}")
@@ -616,7 +670,7 @@ class EnhancedCdbDebugger:
             
             logger.warning("Could not determine current location from CDB output")
             logger.debug(f"Frame output was: {repr(frame_output)}")
-            logger.debug(f"LN output was: {repr(ln_output)}")
+            # Removed ln_output reference (undefined variable)
             return None, 0
             
         except Exception as e:
@@ -726,51 +780,80 @@ class EnhancedCdbDebugger:
 
     def get_local_variables(self, frame_id: int = 0) -> List[CdbVariable]:
         """Get local variables for specific frame"""
-
-        # TODO: remove this once everything works
-        trace = self.communicator.send_command('kn')
-        logger.debug(f"Stack trace for local variables: {trace}")
-
-        # Switch to specific frame if needed
+        # Switch to requested frame
         if frame_id > 0:
             self.communicator.send_command(f'.frame {frame_id}')
 
-        response = self.communicator.send_command('dv /i /t')
-        if response == '> ':
-            logger.warning("No local variables returned from CDB")
-            response = unsolicited = self.communicator.get_unsolicited_output() or ''
-            logger.debug(f"Unsolicited output for locals: {repr(unsolicited)}")
+        # Ensure line info is enabled for richer dv output
+        self.communicator.send_command('.lines -e')
 
-        # Switch back to frame 0
+        # Send dv and then poll for additional unsolicited chunks to build complete output
+        raw = self.communicator.send_command('dv /i /t')
+        logger.debug(f"Raw dv /i /t response: {repr(raw)}")
+        combined = raw
+        end_prompt_patterns = ('0:000>', '>')
+        poll_start = time.time()
+        # Collect for up to 0.4s or until we see a trailing prompt AND some variable content
+        while time.time() - poll_start < 0.4:
+            chunk = self.communicator.get_unsolicited_output()
+            if chunk:
+                logger.debug(f"Unsolicited dv chunk: {repr(chunk)}")
+                combined += chunk
+                # Heuristic: break if we have both a prompt terminator and at least one 'prv ' token
+                if any(combined.rstrip().endswith(p) for p in end_prompt_patterns) and ('prv ' in combined or '=' in combined):
+                    break
+            else:
+                time.sleep(0.02)
+
+        # Restore frame 0
         if frame_id > 0:
             self.communicator.send_command('.frame 0')
 
-        variables = self.parser.parse_variables(response, "local")
-
-        print("Local variables:")
-        print(variables)
-
-        return variables
+        logger.debug(f"Combined dv output: {repr(combined)}")
+        locals_list = self.parser.parse_variables(combined, "local")
+        # If filter resulted in empty but combined output has simple assignments, parse without filter
+        if not locals_list and '=' in combined:
+            logger.debug("Retrying parse without kind_filter due to empty local list")
+            locals_list = self.parser.parse_variables(combined, None)
+        # Deduplicate by name
+        seen = {}
+        for var in locals_list:
+            if var.name not in seen:
+                seen[var.name] = var
+        result = list(seen.values())
+        logger.info(f"Parsed {len(result)} local variables: {[v.name for v in result]}")
+        return result
 
     def get_arguments(self, frame_id: int = 0) -> List[CdbVariable]:
         """Get function arguments for specific frame"""
-        # Switch to specific frame if needed
         if frame_id > 0:
             self.communicator.send_command(f'.frame {frame_id}')
-
-        response = self.communicator.send_command('dv /i /t')
-
-        # Switch back to frame 0
+        self.communicator.send_command('.lines -e')
+        raw = self.communicator.send_command('dv /i /t')
+        combined = raw
+        poll_start = time.time()
+        while time.time() - poll_start < 0.4:
+            chunk = self.communicator.get_unsolicited_output()
+            if chunk:
+                logger.debug(f"Unsolicited param chunk: {repr(chunk)}")
+                combined += chunk
+                if combined.rstrip().endswith('>') and ('prv param' in combined or 'argc' in combined or 'argv' in combined):
+                    break
+            else:
+                time.sleep(0.02)
         if frame_id > 0:
             self.communicator.send_command('.frame 0')
-
-        # Filter for parameters only (this is a simplified approach)
-        variables = self.parser.parse_variables(response, "param")
-
-        print("Function arguments:")
-        print(variables)
-
-        return variables
+        params = self.parser.parse_variables(combined, 'param')
+        if not params and ('argc' in combined or 'argv' in combined):
+            all_vars = self.parser.parse_variables(combined, None)
+            params = [v for v in all_vars if v.name in ('argc','argv')]
+        unique = {}
+        for v in params:
+            if v.name not in unique:
+                unique[v.name] = v
+        result = list(unique.values())
+        logger.info(f"Parsed {len(result)} param variables: {[v.name for v in result]}")
+        return result
 
     def stop(self):
         """Stop the debugger (alias for terminate)"""

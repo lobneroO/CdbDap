@@ -355,62 +355,34 @@ class SocketDAPServer:
     def handle_configuration_done(self, request: Dict[str, Any]):
         """Handle configurationDone request"""
         logger.info("Handling configurationDone request")
-        
-        # This is called after breakpoints are set, so now we can move from 
-        # the initial loader breakpoint to main entry point
-        if self.debugger and self.is_running:
+        # Lightweight: acknowledge configuration and emit a single stopped event for current position.
+        if self.debugger and self.is_running and self.debugger.is_stopped:
             try:
-                logger.info("Debugger positioned, checking if we need to send stopped event")
-                
-                # After go_to_main_entry(), the debugger should be stopped at main or at a user breakpoint
-                # Check if it's stopped and get the current location
-                if self.debugger.is_stopped:
-                    file_path, line_num = self.debugger.get_current_location()
-                    logger.info(f"Debugger is stopped at: {file_path}:{line_num}")
-                    
-                    # Check if this location matches a user breakpoint
-                    reason = 'entry'  # Default to entry
-                    for bp_id, (bp_file, bp_line) in self.breakpoint_locations.items():
-                        if file_path and bp_file in file_path and line_num == bp_line:
-                            logger.info(f"Current location matches breakpoint {bp_id} at {bp_file}:{bp_line}")
-                            reason = 'breakpoint'
-                            break
-                    
-                    # Send the appropriate stopped event
-                    stopped_event = {
-                        'reason': reason,
-                        'threadId': 1,
-                        'allThreadsStopped': True
-                    }
-                    
-                    # Add source location if we have it
-                    if file_path and line_num > 0:
-                        stopped_event['source'] = {
-                            'name': os.path.basename(file_path),
-                            'path': file_path
-                        }
-                        stopped_event['line'] = line_num
-                        stopped_event['column'] = 1
-                    
-                    logger.info(f"Sending stopped event: {stopped_event}")
-                    self.send_event('stopped', stopped_event)
-                else:
-                    logger.warning("Debugger not stopped after go_to_main_entry()")
-                
-            except Exception as e:
-                logger.error(f"Error moving to main entry: {e}")
-                import traceback
-                logger.error(f"Traceback: {traceback.format_exc()}")
-                
-                # If there's an error, send a basic stopped event as fallback
-                self.send_event('stopped', {
-                    'reason': 'entry',
+                file_path, line_num = self.debugger.get_current_location()
+                logger.info(f"configurationDone current location: {file_path}:{line_num}")
+                reason = 'entry'
+                for bp_id, (bp_file, bp_line) in self.breakpoint_locations.items():
+                    if file_path and bp_file and file_path.lower().endswith(os.path.basename(bp_file).lower()) and bp_line == line_num:
+                        reason = 'breakpoint'
+                        break
+                stopped_event = {
+                    'reason': reason,
                     'threadId': 1,
                     'allThreadsStopped': True
-                })
-        
+                }
+                if file_path and line_num > 0:
+                    stopped_event['source'] = {
+                        'name': os.path.basename(file_path),
+                        'path': file_path
+                    }
+                    stopped_event['line'] = line_num
+                    stopped_event['column'] = 1
+                self.send_event('stopped', stopped_event)
+            except Exception as e:
+                logger.error(f"Error fetching current location in configurationDone: {e}")
         self.send_response(request['seq'], 'configurationDone')
 
+    # Restored handler functions (lost in previous patch) --------------------
     def handle_continue(self, request: Dict[str, Any]):
         """Handle continue request"""
         logger.info("Handling continue request")
