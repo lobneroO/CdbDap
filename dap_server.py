@@ -88,6 +88,10 @@ class SocketDAPServer:
 
         # Map breakpoint IDs to their source locations
         self.breakpoint_locations = {}  # bp_id -> (file_path, line)
+        
+        # Container variable tracking for expandable variables
+        self.container_variables = {}  # var_ref -> (container_name, container_type, size)
+        self.next_var_ref = 10000  # Start container references at 10000
 
         try:
             self.debugger = EnhancedCdbDebugger()
@@ -570,10 +574,20 @@ class SocketDAPServer:
         var_ref = args.get('variablesReference', 0)
 
         try:
-            if var_ref >= 1000 and var_ref < 2000:
+            variables = []
+            
+            if var_ref >= 10000:
+                # This is a container expansion request
+                if var_ref in self.container_variables:
+                    container_name, container_type, size = self.container_variables[var_ref]
+                    logger.info(f"Expanding container {container_name} of type {container_type} with size {size}")
+                    variables = self.debugger.get_container_elements(container_name, container_type, size)
+                else:
+                    logger.warning(f"Container reference {var_ref} not found")
+            elif var_ref >= 1000 and var_ref < 2000:
                 frame_id = var_ref - 1000
                 variables = self.debugger.get_local_variables(frame_id)
-            elif var_ref >= 2000:
+            elif var_ref >= 2000 and var_ref < 10000:
                 frame_id = var_ref - 2000
                 variables = self.debugger.get_arguments(frame_id)
             else:
@@ -581,11 +595,20 @@ class SocketDAPServer:
 
             var_list = []
             for var in variables:
+                var_ref_id = 0
+                
+                # If this is a container variable, assign it a variablesReference
+                if hasattr(var, 'is_container') and var.is_container and var.container_size and var.container_size > 0:
+                    var_ref_id = self.next_var_ref
+                    self.container_variables[var_ref_id] = (var.name, var.container_type or 'vector', var.container_size)
+                    self.next_var_ref += 1
+                    logger.info(f"Assigned variablesReference {var_ref_id} to container {var.name}")
+                
                 var_list.append(Variable(
                     name=var.name,
                     value=var.value,
                     type=var.type,
-                    variablesReference=0
+                    variablesReference=var_ref_id
                 ))
 
             self.send_response(request['seq'], 'variables', body={
