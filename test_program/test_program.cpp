@@ -21,6 +21,12 @@ int main(int argc, char** argv) {
     double pi = 3.14159;
     std::string message = "Hello, Debugger!";
     std::vector<int> numbers = {1, 2, 3, 4, 5};
+    int* numbersPtr = new int[5];
+    int numbersArr[] = {2, 4, 8, 16, 32};
+    int twoDim[2][2] = {{1, 2}, {4, 8}};
+    for (int i = 0; i < 5; i++) {
+        numbersPtr[i] = i % 2 == 0 ? numbers[i] : numbersArr[i];
+    }
     
     std::cout << "Number: " << number << std::endl;
     std::cout << "Pi: " << pi << std::endl;

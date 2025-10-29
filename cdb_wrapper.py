@@ -64,6 +64,9 @@ class CdbVariable:
     value: str
     type: str
     address: Optional[str] = None
+    is_container: bool = False
+    container_size: Optional[int] = None
+    container_type: Optional[str] = None  # e.g., 'vector', 'array', 'map'
 
 
 @dataclass
@@ -74,24 +77,48 @@ class CdbThread:
     address: str
 
 
+def clean_integer_value(value: str) -> str:
+    """
+    Clean up integer values by removing CDB-specific formatting.
+
+    CDB often returns integers in the format "0n42" where "0n" indicates
+    decimal format. Since we always want decimal view,
+    we remove the "0n" prefix.
+
+    Args:
+        value: The value string from CDB
+
+    Returns:
+        Cleaned value string with "0n" prefix removed
+    """
+    if isinstance(value, str) and value.startswith('0n'):
+        return value[2:]  # Remove "0n" prefix
+    return value
+
+
 class CdbOutputParser:
     """Parser for CDB output"""
 
     # Regex patterns for parsing CDB output
-    BREAKPOINT_PATTERN = re.compile(r'^\s*(\d+):\s+([0-9a-f`]+)\s+.*?(@#\d+)?\s*(.*)$', re.MULTILINE)
-    STACK_FRAME_PATTERN = re.compile(r'^(\d+)\s+([0-9a-f`]+)\s+([0-9a-f`]+)\s+(.+?)(?:\s+\[(.+?)\s+@\s+(\d+)\])?$', re.MULTILINE)
+    BREAKPOINT_PATTERN = re.compile(
+        r'^\s*(\d+):\s+([0-9a-f`]+)\s+.*?(@#\d+)?\s*(.*)$', re.MULTILINE)
+    STACK_FRAME_PATTERN = re.compile(
+        r'^(\d+)\s+([0-9a-f`]+)\s+([0-9a-f`]+)\s+(.+?)(?:\s+\[(.+?)\s+@\s+(\d+)\])?$',  # noqa: E501
+        re.MULTILINE)
     # Extended variable pattern: allow angle brackets, commas,
     # colons for C++ template types
     # Allow optional leading whitespace to handle indented output
     VARIABLE_PATTERN = re.compile(
-        r'^\s*prv\s+(\w+)\s+([\w\s\*\[\]<>:,]+)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$',
+        r'^\s*prv\s+(\w+)\s+([\w\s\*\[\]<>:,]+)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$',  # noqa : E501
         re.MULTILINE
     )
     # Secondary simple assignment pattern (lines without 'prv' prefix)
     SIMPLE_ASSIGN_PATTERN = re.compile(
         r'^([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$'
     )
-    THREAD_PATTERN = re.compile(r'^\s*(\d+)\s+Id:\s+([0-9a-f.]+)\s+Suspend:\s+(\d+)\s+Teb:\s+([0-9a-f`]+)\s+(.*)$', re.MULTILINE)
+    THREAD_PATTERN = re.compile(
+        r'^\s*(\d+)\s+Id:\s+([0-9a-f.]+)\s+Suspend:\s+(\d+)\s+Teb:\s+([0-9a-f`]+)\s+(.*)$',  # noqa: E501
+        re.MULTILINE)
 
     @classmethod
     def parse_breakpoints(cls, output: str) -> List[CdbBreakpoint]:
@@ -175,10 +202,43 @@ class CdbOutputParser:
         # First collect all structured 'prv' variables
         matches = cls.VARIABLE_PATTERN.findall(output)
         for kind, var_type, name, value in matches:
+            # Check if this is a container type
+            is_container = False
+            container_size = None
+            container_type = None
+
+            if 'std::vector' in var_type or 'vector' in var_type.lower():
+                is_container = True
+                container_type = 'vector'
+                # Extract size from value like "{ size=5 }"
+                size_match = re.search(r'size=(\d+)', value)
+                if size_match:
+                    container_size = int(size_match.group(1))
+            elif (re.search(r'\[\d*\]', var_type)
+                  or ('*' in var_type and 'ptr' not in name.lower())):
+                # Detect C-style arrays by type pattern [n]
+                # or pointer types that might be arrays
+                is_container = True
+                container_type = 'array'
+                # Try to extract array size from type like "int [5]"
+                # or from value
+                array_size_match = re.search(r'\[(\d+)\]', var_type)
+                if array_size_match:
+                    container_size = int(array_size_match.group(1))
+                else:
+                    # For pointer types, we might need
+                    # to infer size from context
+                    # This is harder to determine statically,
+                    # may need runtime inspection
+                    container_size = None
+
             variables.append(CdbVariable(
                 name=name,
-                value=value.strip(),
-                type=var_type.strip() or "unknown"
+                value=clean_integer_value(value.strip()),
+                type=var_type.strip() or "unknown",
+                is_container=is_container,
+                container_size=container_size,
+                container_type=container_type
             ))
 
         # Collect simple assignment lines not already captured
@@ -199,13 +259,50 @@ class CdbOutputParser:
                     # Infer type heuristically for std::string
                     # and vector summaries
                     inferred_type = "unknown"
+                    is_container = False
+                    container_size = None
+                    container_type = None
+
                     if 'basic_string' in value or 'std::string' in value:
                         inferred_type = 'std::string'
                     elif 'size=' in value and '{' in value and '}' in value:
                         inferred_type = 'container'
+                        is_container = True
+                        # Extract size from value like "{ size=5 }"
+                        size_match = re.search(r'size=(\d+)', value)
+                        if size_match:
+                            container_size = int(size_match.group(1))
+                        # Determine container type
+                        # from variable name or context
+                        if 'vector' in name.lower() or 'std::vector' in value:
+                            container_type = 'vector'
+                        elif 'array' in name.lower():
+                            container_type = 'array'
+                        else:
+                            container_type = 'container'
+                    elif (re.search(r'0x[0-9a-fA-F]+', value) and
+                          ('arr' in name.lower()
+                            or 'array' in name.lower()
+                            or name.endswith('s')
+                            and not name.lower().endswith('ss'))):
+                        # Detect potential arrays by name patterns
+                        # and pointer values
+                        # This is a heuristic for variables like "numbersArr"
+                        # or "numbers" that might be arrays
+                        inferred_type = 'array'
+                        is_container = True
+                        container_type = 'array'
+                        # Size is unknown for simple assignments,
+                        # will need runtime inspection
+                        container_size = None
+
                     variables.append(
-                        CdbVariable(name=name, value=value.strip(),
-                                    type=inferred_type))
+                        CdbVariable(name=name,
+                                    value=clean_integer_value(value.strip()),
+                                    type=inferred_type,
+                                    is_container=is_container,
+                                    container_size=container_size,
+                                    container_type=container_type))
 
         # Apply kind filter after collection if provided
         # (retain only filtered names present in structured matches)
@@ -512,7 +609,7 @@ class CdbCommunicator:
                 self.process.stdin.write('q\n')
                 self.process.stdin.flush()
                 self.process.wait(timeout=2)
-            except:
+            except Exception:
                 self.process.terminate()
             self.process = None
 
@@ -943,6 +1040,92 @@ class EnhancedCdbDebugger:
             if 'Evaluate expression:' in line:
                 return line.split(':', 1)[1].strip()
         return response.strip()
+
+    def get_container_elements(
+            self, container_name: str,
+            container_type: str, size: int) -> List[CdbVariable]:
+        """Get elements from a container (vector, array, etc.)"""
+        elements = []
+
+        if container_type == 'vector':
+            # Use dx command to get structured vector information
+            try:
+                dx_response = \
+                    self.communicator.send_command(f'dx {container_name}')
+                logger.debug(f"dx response: {repr(dx_response)}")
+
+                # Parse dx output to extract vector elements
+                # Format: [0]              : 1 [Type: int]
+                element_pattern = re.compile(
+                    r'^\s*\[(\d+)\]\s*:\s*(.+?)\s*\[Type:\s*(.+?)\]')
+
+                for line in dx_response.split('\n'):
+                    match = element_pattern.match(line)
+                    if match:
+                        index, value, element_type = match.groups()
+
+                        # Clean up the value
+                        # (remove extra spaces and 0n prefix)
+                        clean_value = clean_integer_value(value.strip())
+                        clean_type = element_type.strip()
+
+                        elements.append(CdbVariable(
+                            name=f'[{index}]',
+                            value=clean_value,
+                            type=clean_type
+                        ))
+
+                        logger.debug(f"Parsed element [{index}]: "
+                                     f"{clean_value} ({clean_type})")
+
+                logger.info(f"Successfully parsed {len(elements)} "
+                            "elements from dx output")
+
+            except Exception as e:
+                logger.error("Error accessing vector elements for "
+                             f"{container_name}: {e}")
+
+        elif container_type == 'array':
+            # Handle C-style arrays and pointer arrays
+            try:
+                # Try dx command first for structured output
+                # (works for some arrays)
+                dx_response = self.communicator.send_command(
+                    f'dx {container_name}')
+                logger.debug(f"dx response for array: {repr(dx_response)}")
+
+                # Parse dx output to extract array elements
+                # Format: [0]              : 2 [Type: int]
+                element_pattern = re.compile(
+                    r'^\s*\[(\d+)\]\s*:\s*(.+?)\s*\[Type:\s*(.+?)\]')
+
+                for line in dx_response.split('\n'):
+                    match = element_pattern.match(line)
+                    if match:
+                        index, value, element_type = match.groups()
+
+                        # Clean up the value
+                        # (remove extra spaces and 0n prefix)
+                        clean_value = clean_integer_value(value.strip())
+                        clean_type = element_type.strip()
+
+                        elements.append(CdbVariable(
+                            name=f'[{index}]',
+                            value=clean_value,
+                            type=clean_type
+                        ))
+
+                        logger.debug(f"Parsed array element [{index}]: "
+                                     f"{clean_value} ({clean_type})")
+
+                logger.info(f"Successfully parsed {len(elements)} "
+                            "array elements")
+
+            except Exception as e:
+                logger.error("Error accessing array elements for "
+                             f"{container_name}: {e}")
+
+        return elements
 
     def get_memory(self, address: str, size: int = 16) -> str:
         """Get memory contents"""
