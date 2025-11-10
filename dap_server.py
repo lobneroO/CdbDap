@@ -586,14 +586,34 @@ class SocketDAPServer:
                                 f"of type {container_type} with size {size}")
                     variables = self.debugger.get_container_elements(
                         container_name, container_type, size)
+                    
+                    # For nested struct/class members, we need to qualify their names
+                    # with the parent container name so they can be expanded later
+                    if container_type in ['struct', 'class']:
+                        for var in variables:
+                            if hasattr(var, 'is_container') and var.is_container and var.container_type in ['struct', 'class']:
+                                # Update the name to include the parent container path
+                                var.qualified_name = f"{container_name}.{var.name}"
+                            else:
+                                var.qualified_name = var.name
+                    else:
+                        # For other container types (vector, array), keep original names
+                        for var in variables:
+                            var.qualified_name = var.name
                 else:
                     logger.warning(f"Container reference {var_ref} not found")
             elif var_ref >= 1000 and var_ref < 2000:
                 frame_id = var_ref - 1000
                 variables = self.debugger.get_local_variables(frame_id)
+                # For top-level variables, use their direct names
+                for var in variables:
+                    var.qualified_name = var.name
             elif var_ref >= 2000 and var_ref < 10000:
                 frame_id = var_ref - 2000
                 variables = self.debugger.get_arguments(frame_id)
+                # For top-level variables, use their direct names
+                for var in variables:
+                    var.qualified_name = var.name
             else:
                 variables = []
 
@@ -604,16 +624,22 @@ class SocketDAPServer:
                 # If this is a container variable,
                 # assign it a variablesReference
                 if (hasattr(var, 'is_container')
-                        and var.is_container
-                        and var.container_size
-                        and var.container_size > 0):
-                    var_ref_id = self.next_var_ref
-                    self.container_variables[var_ref_id] = \
-                        (var.name,
-                         var.container_type or 'vector', var.container_size)
-                    self.next_var_ref += 1
-                    logger.info(f"Assigned variablesReference {var_ref_id} "
-                                f"to container {var.name}")
+                        and var.is_container):
+                    # For containers with size (vectors, arrays), check size > 0
+                    # For struct/class objects, always allow expansion regardless of size
+                    if (var.container_type in ['struct', 'class'] or
+                        (var.container_size and var.container_size > 0)):
+                        var_ref_id = self.next_var_ref
+                        
+                        # Use qualified name if available (for nested members), otherwise use regular name
+                        storage_name = getattr(var, 'qualified_name', var.name)
+                        
+                        self.container_variables[var_ref_id] = \
+                            (storage_name,
+                             var.container_type or 'vector', var.container_size)
+                        self.next_var_ref += 1
+                        logger.info(f"Assigned variablesReference {var_ref_id} "
+                                    f"to container {var.name} (stored as {storage_name}) of type {var.container_type}")
 
                 var_list.append(Variable(
                     name=var.name,

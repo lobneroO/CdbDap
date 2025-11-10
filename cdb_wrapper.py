@@ -121,6 +121,71 @@ class CdbOutputParser:
         re.MULTILINE)
 
     @classmethod
+    def _is_struct_or_class_type(cls, var_type: str, value: str) -> bool:
+        """
+        Determine if a variable is a struct or class type.
+        
+        Args:
+            var_type: The type string from CDB (e.g., "Point", "struct Point", "class Rectangle")
+            value: The value string from CDB (e.g., "{x=10 y=20}")
+            
+        Returns:
+            True if this appears to be a struct or class type, False otherwise
+        """
+        var_type = var_type.strip()
+        value = value.strip()
+        
+        logger.debug(f"_is_struct_or_class_type: type='{var_type}', value='{value}'")
+        
+        # Check for explicit struct/class keywords
+        if var_type.startswith('struct ') or var_type.startswith('class '):
+            logger.debug("Found explicit struct/class keyword")
+            return True
+        
+        # Check for aggregate initializer patterns in value (indicates compound type)
+        # Format: {member1=value1 member2=value2 ...}
+        if (value.startswith('{') and value.endswith('}') and 
+            '=' in value and len(value) > 2):
+            logger.debug("Found aggregate initializer pattern")
+            return True
+        
+        # Check for custom type names (not primitive types)
+        # Primitive types: int, char, float, double, bool, void, etc.
+        primitive_types = {
+            'int', 'char', 'float', 'double', 'bool', 'void', 'long', 'short',
+            'unsigned', 'signed', 'size_t', 'wchar_t', 'int8_t', 'int16_t', 
+            'int32_t', 'int64_t', 'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t'
+        }
+        
+        # Remove pointer/reference markers and array brackets for type check
+        clean_type = var_type.replace('*', '').replace('&', '').replace('const ', '').strip()
+        clean_type = re.sub(r'\s*\[\d*\]\s*', '', clean_type)  # Remove array brackets
+        
+        logger.debug(f"Clean type: '{clean_type}'")
+        
+        # Check for value patterns that indicate struct/class types
+        # When a struct/class doesn't have explicit keyword, the value often shows (TypeName)
+        if value and value.startswith('(') and value.endswith(')'):
+            # Extract type name from parentheses
+            paren_type = value[1:-1].strip()
+            if paren_type == clean_type:
+                logger.debug(f"Value pattern ({paren_type}) matches type, identified as struct/class")
+                return True
+        
+        # If it's not a primitive type and not a standard library container, 
+        # it's likely a custom struct/class
+        if (clean_type not in primitive_types and 
+            not clean_type.startswith('std::') and
+            not clean_type.startswith('basic_') and
+            # Exclude pointers to primitives
+            not any(prim in clean_type.lower() for prim in primitive_types)):
+            logger.debug(f"Type '{clean_type}' identified as custom struct/class")
+            return True
+        
+        logger.debug(f"Type '{clean_type}' not identified as struct/class")    
+        return False
+
+    @classmethod
     def parse_breakpoints(cls, output: str) -> List[CdbBreakpoint]:
         """Parse breakpoint list output"""
         breakpoints = []
@@ -231,6 +296,11 @@ class CdbOutputParser:
                     # This is harder to determine statically,
                     # may need runtime inspection
                     container_size = None
+            elif cls._is_struct_or_class_type(var_type, value):
+                # Detect custom struct/class types
+                is_container = True
+                container_type = 'struct' if 'struct' in var_type.lower() else 'class'
+                container_size = None  # Structs/classes don't have a "size" in the traditional sense
 
             variables.append(CdbVariable(
                 name=name,
@@ -1124,6 +1194,72 @@ class EnhancedCdbDebugger:
             except Exception as e:
                 logger.error("Error accessing array elements for "
                              f"{container_name}: {e}")
+
+        elif container_type in ['struct', 'class']:
+            # Handle struct and class member inspection
+            try:
+                # Use dx command to get structured object information
+                dx_response = self.communicator.send_command(f'dx {container_name}')
+                logger.debug(f"dx response for {container_type}: {repr(dx_response)}")
+
+                # Parse dx output to extract struct/class members
+                # Format examples:
+                # [+0x000] x                : 10 [Type: int]
+                # [+0x004] y                : 20 [Type: int] 
+                # [+0x000] width            : 100 [Type: int]
+                # [+0x004] height           : 50 [Type: int]
+                # [+0x008] topLeft          [Type: Point]
+                member_pattern = re.compile(
+                    r'^\s*\[.*?\]\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(?::\s*(.+?))?\s*\[Type:\s*(.+?)\]\s*$')
+
+                for line in dx_response.split('\n'):
+                    line = line.strip()
+                    if not line:
+                        continue
+                        
+                    match = member_pattern.match(line)
+                    if match:
+                        member_name, value, member_type = match.groups()
+
+                        # Handle cases where value is None (no colon-separated value)
+                        if value is None:
+                            clean_value = f"({member_type.strip()})"  # Show type as placeholder
+                        else:
+                            # Clean up the value (remove extra spaces and 0n prefix)
+                            clean_value = clean_integer_value(value.strip())
+                        clean_type = member_type.strip()
+
+                        # Check if this member is itself a struct/class that can be expanded
+                        is_container = False
+                        container_size = None
+                        container_type_inner = None
+                        
+                        logger.debug(f"Checking if member {member_name} is struct/class: type='{clean_type}', value='{clean_value}'")
+                        if self.parser._is_struct_or_class_type(clean_type, clean_value):
+                            is_container = True
+                            container_type_inner = 'struct' if 'struct' in clean_type.lower() else 'class'
+                            logger.debug(f"Identified {member_name} as {container_type_inner}")
+                        else:
+                            logger.debug(f"Member {member_name} not identified as struct/class")
+
+                        elements.append(CdbVariable(
+                            name=member_name,
+                            value=clean_value,
+                            type=clean_type,
+                            is_container=is_container,
+                            container_size=container_size,
+                            container_type=container_type_inner
+                        ))
+
+                        logger.debug(f"Parsed {container_type} member {member_name}: "
+                                   f"{clean_value} ({clean_type})")
+
+                logger.info(f"Successfully parsed {len(elements)} "
+                          f"{container_type} members")
+
+            except Exception as e:
+                logger.error(f"Error accessing {container_type} members for "
+                           f"{container_name}: {e}")
 
         return elements
 
