@@ -1210,6 +1210,35 @@ class EnhancedCdbDebugger:
         """Stop the debugger (alias for terminate)"""
         self.terminate()
 
+    # Frame name patterns that identify threads owned by CDB / the Windows
+    # debugging subsystem rather than by the debuggee's own code.
+    _CDB_FRAME_PATTERNS = re.compile(
+        r'DbgUiRemoteBreakin'       # CDB's remote-breakin thread
+        r'|DbgUiWaitStateChange'    # Debug event wait loop
+        r'|RtlDebugSystemBreakPoint'  # ntdll system breakpoint helper
+        r'|DbgBreakPoint',          # Generic debug breakpoint shim
+        re.IGNORECASE
+    )
+
+    def _is_cdb_thread(self, thread_id: int) -> bool:
+        """Return True if *thread_id*'s stack consists only of Windows
+        debugging-subsystem frames, indicating that this thread was created
+        by CDB (or the OS on CDB's behalf) and is not part of the debuggee's
+        own logic.
+
+        Detection is based on the cached ``_stack_cache`` populated by
+        ``prefetch_all_stacks``; if no cache entry exists the method returns
+        False (conservative: don't mislabel threads we can't inspect).
+        """
+        frames = self._stack_cache.get(thread_id)
+        if not frames:
+            return False
+        return any(
+            self._CDB_FRAME_PATTERNS.search(f.name)
+            for f in frames
+            if f.name
+        )
+
     def get_threads(self) -> List[CdbThread]:
         """Get thread list with names where available."""
         response = self.communicator.send_command('~')
@@ -1230,6 +1259,15 @@ class EnhancedCdbDebugger:
             # Use cached name if available
             if thread.id in self._thread_name_cache:
                 thread.name = self._thread_name_cache[thread.id]
+                continue
+
+            # Check whether this is a CDB-internal thread (e.g. the remote
+            # breakin thread injected by the Windows debugging subsystem).
+            # We detect this by looking for well-known CDB frame names in the
+            # prefetched stack cache — no extra CDB round-trip required.
+            if self._is_cdb_thread(thread.id):
+                thread.name = f"[CDB] Thread {thread.id + 1}"
+                self._thread_name_cache[thread.id] = thread.name
                 continue
 
             if not thread.name:
