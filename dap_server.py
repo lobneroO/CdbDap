@@ -349,15 +349,53 @@ class SocketDAPServer:
             return
 
         try:
+            # DAP setBreakpoints is authoritative: it provides the complete
+            # desired set of breakpoints for this file.  Remove any existing
+            # breakpoints for this file that are NOT in the new list.
+            desired_lines = {bp.get('line') for bp in breakpoints
+                             if bp.get('line')}
+            for bp_id, (bp_file, bp_line) \
+                    in list(self.breakpoint_locations.items()):
+                if (bp_file.lower() == file_path.lower()
+                        and bp_line not in desired_lines):
+                    try:
+                        self.debugger.remove_breakpoint(bp_id)
+                        logger.info(f"Removed stale breakpoint {bp_id} at "
+                                    f"{bp_file}:{bp_line}")
+                    except Exception as e:
+                        logger.warning(f"Failed to remove breakpoint "
+                                       f"{bp_id}: {e}")
+                    del self.breakpoint_locations[bp_id]
+
+            # Build a reverse map of line -> existing bp_id for this file so
+            # we can skip re-setting breakpoints that are already in CDB.
+            existing_line_to_id = {
+                bp_line: bp_id
+                for bp_id, (bp_file, bp_line)
+                in self.breakpoint_locations.items()
+                if bp_file.lower() == file_path.lower()
+            }
+
             result_breakpoints = []
             for bp in breakpoints:
                 line = bp.get('line')
                 if line:
+                    # Re-use existing breakpoint if already set at this line.
+                    if line in existing_line_to_id:
+                        bp_id = existing_line_to_id[line]
+                        result_breakpoints.append(Breakpoint(
+                            id=bp_id,
+                            verified=True,
+                            line=line,
+                            source=Source(path=file_path,
+                                          name=os.path.basename(file_path))
+                        ))
+                        continue
                     try:
                         bp_id = self.debugger.set_breakpoint(file_path, line)
                         # Store breakpoint location for later reference
                         self.breakpoint_locations[bp_id] = (file_path, line)
-                        logger.info("Stored breakpoint {bp_id} at "
+                        logger.info(f"Stored breakpoint {bp_id} at "
                                     f"{file_path}:{line}")
 
                         result_breakpoints.append(Breakpoint(

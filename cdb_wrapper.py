@@ -766,11 +766,32 @@ class EnhancedCdbDebugger:
         logger.info(f"Attempting to set breakpoint {bp_id} at "
                     f"{file_path}:{line}")
 
+        # CDB cannot accept breakpoint commands while the target is running –
+        # its stdin is ignored until it reaches a debug event.  When the
+        # debugger is running we must briefly interrupt it, set the breakpoint,
+        # then resume.  Because this whole call is made from inside a
+        # synchronous DAP message handler, check_for_events() cannot fire
+        # until the handler returns, so the intermediate stop is never visible
+        # to the DAP client.
+        was_running = not self.is_stopped
+        if was_running:
+            logger.info("Debugger is running; pausing to set breakpoint...")
+            import signal as _signal
+            try:
+                os.kill(self.communicator.process.pid,
+                        _signal.CTRL_BREAK_EVENT)
+                logger.info("Sent CTRL_BREAK_EVENT to pause CDB")
+            except Exception as e:
+                logger.error(f"CTRL_BREAK_EVENT failed: {e}")
+                was_running = False  # can't resume what we didn't pause
+            # Wait for CDB to reach a prompt.  Use .echo as a harmless
+            # round-trip that won't change thread context or any state.
+            self.communicator.send_command('.echo bp_pause', timeout=15.0)
+            self.is_stopped = True
+
         # Try different CDB breakpoint syntax variations
         commands_to_try = [
             f'bp `{file_path}:{line}`',  # Standard syntax with backticks
-            # f'bp "{file_path}:{line}"',  # With quotes
-            # f'bm {file_path}:{line}',    # Different breakpoint command
         ]
 
         verified = False
@@ -800,83 +821,169 @@ class EnhancedCdbDebugger:
                     # Unknown response - might be success or failure
                     logger.warning("Ambiguous breakpoint response: "
                                    f"{response}")
-                    # Don't assume success, try next command
                     continue
             else:
-                # Empty response might mean success in CDB
-                logger.info("Empty response - might indicate success")
+                # Empty response means success in CDB
+                logger.info("Empty response - indicates success")
                 verified = True
                 break
 
-        # Always verify by listing breakpoints, regardless of initial response
-        logger.info("Verifying breakpoint by listing all breakpoints...")
-        bl_response = self.communicator.send_command("bl")
-        logger.info(f"Breakpoint list response: {repr(bl_response)}")
+        # Only verify via 'bl' when the debugger is stopped.  When the
+        # program is running, 'bl' will time out because CDB is busy; the
+        # empty response from 'bp' is already the normal success indicator.
+        # In that case we defer CDB-ID resolution to remove_breakpoint().
+        actual_cdb_id = None
+        if self.is_stopped:
+            logger.info("Verifying breakpoint by listing all breakpoints...")
+            bl_response = self.communicator.send_command("bl")
+            logger.info(f"Breakpoint list response: {repr(bl_response)}")
 
-        # Parse the breakpoint list to see if our breakpoint is actually there
-        bp_found = False
-        if bl_response:
-            lines = bl_response.split('\n')
-            for bp_line in lines:
-                # Look for our file and line in the breakpoint list
-                # CDB format might be like:
-                # "0 e Disable BreakAddress  Module!Function+Offset"
-                if (str(line) in bp_line and
-                        (file_path.split('\\')[-1] in bp_line
-                         or file_path.split('/')[-1] in bp_line)):
-                    logger.info(f"Found breakpoint in list: {bp_line.strip()}")
-                    bp_found = True
-                    break
-                # Also check if the line number appears in the breakpoint info
-                elif f":{line}" in bp_line or f"@{line}" in bp_line:
-                    logger.info("Found line reference in breakpoint: "
-                                f"{bp_line.strip()}")
-                    bp_found = True
+            # CDB bl format:
+            #   {id} {e|d} {address} [{file} @ {line}]  ...
+            # Parse out the CDB-assigned numeric ID so remove_breakpoint
+            # sends the right 'bc' command even after IDs are recycled.
+            bl_id_re = re.compile(r'^\s*(\d+)\s+[edy]', re.IGNORECASE)
+            file_basename = os.path.basename(file_path)
+            if bl_response:
+                for bp_line in bl_response.split('\n'):
+                    if (file_basename in bp_line and
+                            (f'@ {line}]' in bp_line
+                             or f'@{line}]' in bp_line
+                             or f':{line}' in bp_line)):
+                        logger.info(
+                            f"Found breakpoint in list: {bp_line.strip()}")
+                        verified = True
+                    elif f'@ {line}]' in bp_line or f'@{line}]' in bp_line:
+                        logger.info("Found line reference in breakpoint: "
+                                    f"{bp_line.strip()}")
+                        verified = True
+                    else:
+                        continue
+                    m = bl_id_re.match(bp_line)
+                    if m:
+                        actual_cdb_id = int(m.group(1))
+                        logger.info(
+                            f"Parsed CDB breakpoint ID: {actual_cdb_id}")
                     break
 
-        if bp_found:
-            logger.info("Breakpoint successfully verified in breakpoint list")
-            verified = True
+            if not verified:
+                logger.error("Breakpoint NOT found in breakpoint list "
+                             "- setting failed!")
         else:
-            logger.error("Breakpoint NOT found in breakpoint list "
-                         "- setting failed!")
-            verified = False
-
-            # Try one more approach,
-            # set breakpoint using function name if available
-            logger.info("Attempting to set breakpoint "
-                        "using function approach...")
-            func_command = f"bp main+{line-1}"  # Rough estimate
-            func_response = self.communicator.send_command(func_command)
-            logger.info(f"Function breakpoint response: {repr(func_response)}")
-
-            # Check again
-            bl_response2 = self.communicator.send_command("bl")
-            logger.info(f"Second breakpoint list: {repr(bl_response2)}")
-            if bl_response2 and "main" in bl_response2:
-                verified = True
-                logger.info("Function-based breakpoint appears to have worked")
+            # Program is running: trust the empty/success bp response.
+            # The real CDB ID will be resolved lazily via 'bl' when
+            # remove_breakpoint() is called (guaranteed at a stop).
+            logger.info("Breakpoint set while running; skipping bl "
+                        "verification (CDB ID will be resolved on removal)")
 
         self.breakpoints[bp_id] = {
             'file': file_path,
             'line': line,
             'verified': verified,
-            'cdb_id': bp_id,
+            'cdb_id': actual_cdb_id,  # None = unresolved, looked up on removal
             'response': response
         }
 
         logger.info(f"Set breakpoint {bp_id} at {file_path}:{line}, "
                     f"verified: {verified}")
+
+        # Resume execution if we interrupted it for this breakpoint.
+        if was_running:
+            logger.info("Resuming CDB execution after silent breakpoint pause")
+            self.is_stopped = False
+            try:
+                # Use 'gh' (go handled) rather than bare 'g': when we interrupted
+                # the target via CTRL_BREAK_EVENT, CDB has a pending
+                # Control-Break exception (40010008).  A plain 'g' causes CDB
+                # to re-deliver it as first-chance (stopping again).  'gn'
+                # (not handled) would pass it to the target's default handler
+                # which terminates the process.  'gh' marks the exception as
+                # handled by the debugger so the target never sees it and
+                # execution resumes cleanly.
+                self.communicator.process.stdin.write('gh\n')
+                self.communicator.process.stdin.flush()
+            except Exception as e:
+                logger.error(f"Error resuming after breakpoint pause: {e}")
+
         return bp_id
+
+    def _resolve_cdb_id(self, bp_id: int) -> Optional[int]:
+        """Look up the actual CDB breakpoint ID for *bp_id* by running 'bl'.
+        Updates the stored entry in self.breakpoints and returns the CDB ID,
+        or None if it cannot be found."""
+        entry = self.breakpoints.get(bp_id)
+        if entry is None:
+            return None
+        # Already resolved.
+        if entry['cdb_id'] is not None:
+            return entry['cdb_id']
+        try:
+            bl_response = self.communicator.send_command('bl')
+            bl_id_re = re.compile(r'^\s*(\d+)\s+[edy]', re.IGNORECASE)
+            file_basename = os.path.basename(entry['file'])
+            line = entry['line']
+            for bp_line in (bl_response or '').split('\n'):
+                if (file_basename in bp_line and
+                        (f'@ {line}]' in bp_line
+                         or f'@{line}]' in bp_line
+                         or f':{line}' in bp_line)):
+                    pass
+                elif f'@ {line}]' in bp_line or f'@{line}]' in bp_line:
+                    pass
+                else:
+                    continue
+                m = bl_id_re.match(bp_line)
+                if m:
+                    cdb_id = int(m.group(1))
+                    entry['cdb_id'] = cdb_id
+                    logger.info(f"Lazily resolved CDB ID for bp {bp_id}: "
+                                f"{cdb_id}")
+                    return cdb_id
+                break
+        except Exception as e:
+            logger.warning(f"Could not resolve CDB ID for bp {bp_id}: {e}")
+        return None
 
     def remove_breakpoint(self, bp_id: int):
         """Remove breakpoint"""
-        if bp_id in self.breakpoints:
-            cdb_id = self.breakpoints[bp_id]['cdb_id']
-            command = f'bc {cdb_id}'
-            self.communicator.send_command(command)
-            del self.breakpoints[bp_id]
-            logger.info(f"Removed breakpoint {bp_id}")
+        if bp_id not in self.breakpoints:
+            return
+
+        # Like set_breakpoint, CDB ignores 'bc' commands sent while the target
+        # is running.  Pause first, remove, then resume.
+        was_running = not self.is_stopped
+        if was_running:
+            logger.info(f"Pausing CDB to remove breakpoint {bp_id}...")
+            import signal as _signal
+            try:
+                os.kill(self.communicator.process.pid,
+                        _signal.CTRL_BREAK_EVENT)
+                logger.info("Sent CTRL_BREAK_EVENT to pause CDB for removal")
+            except Exception as e:
+                logger.error(f"CTRL_BREAK_EVENT failed during removal: {e}")
+                was_running = False
+            self.communicator.send_command('.echo bp_remove', timeout=15.0)
+            self.is_stopped = True
+
+        cdb_id = self._resolve_cdb_id(bp_id)
+        if cdb_id is not None:
+            self.communicator.send_command(f'bc {cdb_id}')
+        else:
+            logger.warning(f"Could not determine CDB ID for bp {bp_id}; "
+                           "breakpoint may not be removed from CDB")
+        del self.breakpoints[bp_id]
+        logger.info(f"Removed breakpoint {bp_id}")
+
+        if was_running:
+            logger.info("Resuming after silent removal pause")
+            self.is_stopped = False
+            try:
+                # 'gh' = go handled: discard the CTRL_BREAK exception
+                # without passing it to the target (see set_breakpoint note)
+                self.communicator.process.stdin.write('gh\n')
+                self.communicator.process.stdin.flush()
+            except Exception as e:
+                logger.error(f"Error resuming after removal pause: {e}")
 
     def list_breakpoints(self) -> List[CdbBreakpoint]:
         """List all current breakpoints"""
@@ -1543,6 +1650,24 @@ class EnhancedCdbDebugger:
                 or 'access violation' in output.lower()):
             logger.info("Detected exception - will be ignored: "
                         f"{output[:100]}...")
+
+            # Control-Break (40010008) is a debugger-injected interrupt we
+            # generate ourselves via CTRL_BREAK_EVENT.  CDB sometimes
+            # re-delivers it as a new stop even after we sent 'gh' inside
+            # set_breakpoint/remove_breakpoint.  When we see this exception
+            # in output that contains a CDB prompt (i.e. CDB is waiting for
+            # input), automatically send 'gh' so execution resumes without
+            # the client ever being notified of a spurious stop.
+            is_ctrl_break = '40010008' in output
+            has_prompt = bool(re.search(r'\d+:\d+>', output))
+            if is_ctrl_break and has_prompt and not self.is_stopped:
+                logger.info("Auto-dismissing Control-Break exception with gh")
+                try:
+                    self.communicator.process.stdin.write('gh\n')
+                    self.communicator.process.stdin.flush()
+                except Exception as e:
+                    logger.error(f"Error sending gh for ctrl-break: {e}")
+
             # Don't treat exceptions as breakpoint hits
             return None
 
