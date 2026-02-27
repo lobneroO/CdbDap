@@ -742,6 +742,12 @@ class EnhancedCdbDebugger:
         # stackTrace requests for any thread are served instantly without
         # an extra CDB round-trip.  Cleared on every resume.
         self._stack_cache: Dict[int, List['CdbFrame']] = {}
+        # IDs of threads that existed at the very first stop and were
+        # identified (via kn 5) as CDB/OS-injected threads.  This set is
+        # captured once and then frozen: threads that appear later were
+        # started by the debuggee and must never be labelled [CDB].
+        self._startup_cdb_thread_ids: set = set()
+        self._startup_threads_captured: bool = False
 
     def start(self, program: str, args: List[str] = None,
               cwd: str = None) -> bool:
@@ -1210,13 +1216,21 @@ class EnhancedCdbDebugger:
         """Stop the debugger (alias for terminate)"""
         self.terminate()
 
-    # Frame name patterns that identify threads owned by CDB / the Windows
-    # debugging subsystem rather than by the debuggee's own code.
+    # Frame name patterns that identify threads that are NOT user code:
+    # CDB-injected threads and Windows OS/thread-pool threads.
+    # Any thread whose top frames match these patterns consists entirely of
+    # system or debugger machinery and can be labelled [CDB] so the user
+    # knows to focus elsewhere.
     _CDB_FRAME_PATTERNS = re.compile(
-        r'DbgUiRemoteBreakin'       # CDB's remote-breakin thread
-        r'|DbgUiWaitStateChange'    # Debug event wait loop
-        r'|RtlDebugSystemBreakPoint'  # ntdll system breakpoint helper
-        r'|DbgBreakPoint',          # Generic debug breakpoint shim
+        r'DbgUiRemoteBreakin'           # CDB's remote-breakin thread
+        r'|DbgUiWaitStateChange'        # Debug event wait loop
+        r'|RtlDebugSystemBreakPoint'    # ntdll system breakpoint helper
+        r'|DbgBreakPoint'              # Generic debug breakpoint shim
+        # Windows thread-pool worker threads (visible in every process at
+        # startup; none of these contain user code)
+        r'|ZwWaitForWorkViaWorkerFactory'
+        r'|TpWorkerThread'
+        r'|RtlpTpWorkerThreadStart',
         re.IGNORECASE
     )
 
@@ -1261,20 +1275,34 @@ class EnhancedCdbDebugger:
                 thread.name = self._thread_name_cache[thread.id]
                 continue
 
-            # Check whether this is a CDB-internal thread (e.g. the remote
-            # breakin thread injected by the Windows debugging subsystem).
-            # We detect this by looking for well-known CDB frame names in the
-            # prefetched stack cache — no extra CDB round-trip required.
-            if self._is_cdb_thread(thread.id):
+            # If this thread is in the frozen startup-CDB set, label it
+            # immediately without any extra CDB round-trips.
+            if self._startup_threads_captured \
+                    and thread.id in self._startup_cdb_thread_ids:
                 thread.name = f"[CDB] Thread {thread.id + 1}"
                 self._thread_name_cache[thread.id] = thread.name
                 continue
 
-            if not thread.name:
-                try:
-                    if current_cdb_thread != thread.id:
-                        self.communicator.send_command(f'~{thread.id}s')
-                        current_cdb_thread = thread.id
+            try:
+                # Switch to this thread (needed for both the CDB-thread check
+                # and the dx name lookup below).
+                if current_cdb_thread != thread.id:
+                    self.communicator.send_command(f'~{thread.id}s')
+                    current_cdb_thread = thread.id
+
+                # On the very first stop we sample the top frames to decide
+                # which threads are CDB/OS-injected.  After that the set is
+                # frozen: threads that appear later were started by the
+                # debuggee and are never added.
+                if not self._startup_threads_captured:
+                    kn_out = self.communicator.send_command('kn 5')
+                    if self._CDB_FRAME_PATTERNS.search(kn_out):
+                        self._startup_cdb_thread_ids.add(thread.id)
+                        thread.name = f"[CDB] Thread {thread.id + 1}"
+                        self._thread_name_cache[thread.id] = thread.name
+                        continue
+
+                if not thread.name:
                     name_out = self.communicator.send_command(
                         'dx @$curthread.Name')
                     # Output when name is set:
@@ -1285,9 +1313,9 @@ class EnhancedCdbDebugger:
                         r'@\$curthread\.Name\s*:\s*"([^"]+)"', name_out)
                     if m:
                         thread.name = m.group(1)
-                except Exception as e:
-                    logger.debug(f"Could not get name for thread "
-                                 f"{thread.id}: {e}")
+            except Exception as e:
+                logger.debug(f"Could not get name for thread "
+                             f"{thread.id}: {e}")
 
             # Fall back: use a 1-based label matching the DAP thread id
             if not thread.name:
@@ -1295,6 +1323,13 @@ class EnhancedCdbDebugger:
 
             # Cache whatever name we resolved
             self._thread_name_cache[thread.id] = thread.name
+
+        # After processing all threads at the first stop, freeze the CDB set.
+        if not self._startup_threads_captured:
+            self._startup_threads_captured = True
+            logger.info(
+                f"Captured startup CDB thread IDs: "
+                f"{self._startup_cdb_thread_ids}")
 
         # Restore original CDB thread context if we changed it
         if current_cdb_thread != saved_thread:
