@@ -65,8 +65,8 @@ With everything set up, start `python dap_server.py` and then start a debugging 
 As this is an early state, there are lots of issues. Some of them are listed here - so you have been warned.
 
 * Errors not caught correctly - In my program I'm trying this out on, there is a line of code that I haven't been able to get past; still neovim never showed me that the debugger stopped executing. The program didn't crash.
-* StopOnEntry - Not supported yet. cdb has a stop on entry functionality, but if you have debugged in lldb or gdb before, you expect this to stop at the beginning of the main function. cdb stops elsewhere, so for now this is "disabled".
 * When debugging the test_program.cpp in this repository, multiple threads are started (by Cdb).
 This is annoying during debugging, but the "unimportant" threads don't have user code associated, so this should not be a big issue.
+The threads of Cdb are marked as bein Cdb threads however.
 * There is support for C style arrays and std::vectors, but not for other containers (yet).
 * There is limited support for objects of structs and classes. E.g. in the test_program.cpp You can look into Rectangle, Point and Node - however in the case of Node, the next member will show only an address (that can be expanded though).
