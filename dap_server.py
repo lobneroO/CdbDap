@@ -103,6 +103,13 @@ class SocketDAPServer:
         self.container_variables = {}
         self.next_var_ref = 10000  # Start container references at 10000
 
+        # Frame map: global_frame_id -> (cdb_thread_id, cdb_frame_index).
+        # Frame IDs must be unique across ALL threads when allThreadsStopped
+        # is True (DAP spec).  We assign them sequentially here and clear the
+        # map at every new stop so stale entries never leak across sessions.
+        self._frame_map: Dict[int, tuple] = {}
+        self._next_frame_id: int = 0
+
         try:
             self.debugger = EnhancedCdbDebugger()
             logger.info("Successfully created CDB debugger instance")
@@ -412,6 +419,9 @@ class SocketDAPServer:
                     stopped_event['line'] = line_num
                     stopped_event['column'] = 1
                 self._sync_threads()
+                # Reset frame map so IDs are unique for each new stop.
+                self._frame_map.clear()
+                self._next_frame_id = 0
                 self.send_event('stopped', stopped_event)
             except Exception as e:
                 logger.error("Error fetching current location "
@@ -437,6 +447,10 @@ class SocketDAPServer:
             thread_id = self.debugger.current_thread_id + 1
 
             self._sync_threads()
+
+            # Reset frame map so IDs are unique for each new stop.
+            self._frame_map.clear()
+            self._next_frame_id = 0
 
             stopped_body = {
                 'reason': 'step',
@@ -472,6 +486,10 @@ class SocketDAPServer:
             thread_id = self.debugger.current_thread_id + 1
 
             self._sync_threads()
+
+            # Reset frame map so IDs are unique for each new stop.
+            self._frame_map.clear()
+            self._next_frame_id = 0
 
             stopped_body = {
                 'reason': 'pause',
@@ -627,8 +645,19 @@ class SocketDAPServer:
             frames = self.debugger.get_stack_trace(thread_id)
             stack_frames = []
             for i, frame in enumerate(frames):
+                # Assign a globally-unique frame ID across all threads.
+                # DAP requires uniqueness when allThreadsStopped is True.
+                # _next_frame_id is reset to 0 on every new stop event so
+                # IDs never leak between separate pauses.
+                frame_id = self._next_frame_id
+                self._next_frame_id += 1
+                # Remember which CDB thread + frame index this ID maps to so
+                # that subsequent scopes/variables requests can switch to the
+                # right thread before querying CDB.
+                self._frame_map[frame_id] = (thread_id, i)
+
                 stack_frames.append(StackFrame(
-                    id=i,
+                    id=frame_id,
                     name=frame.name,
                     line=frame.line,
                     column=0,
@@ -699,13 +728,29 @@ class SocketDAPServer:
                     logger.warning(f"Container reference {var_ref} not found")
             elif var_ref >= 1000 and var_ref < 2000:
                 frame_id = var_ref - 1000
-                variables = self.debugger.get_local_variables(frame_id)
+                # Look up which CDB thread and frame index this frame belongs
+                # to.  Without this, variables from a non-active thread would
+                # be queried in the wrong CDB thread context.
+                if frame_id in self._frame_map:
+                    cdb_thread_id, cdb_frame_idx = self._frame_map[frame_id]
+                    if cdb_thread_id != self.debugger.current_thread_id:
+                        self.debugger.switch_thread(cdb_thread_id)
+                    variables = self.debugger.get_local_variables(cdb_frame_idx)
+                else:
+                    variables = self.debugger.get_local_variables(frame_id)
                 # For top-level variables, use their direct names
                 for var in variables:
                     var.qualified_name = var.name
             elif var_ref >= 2000 and var_ref < 10000:
                 frame_id = var_ref - 2000
-                variables = self.debugger.get_arguments(frame_id)
+                # Same thread-aware lookup for function arguments.
+                if frame_id in self._frame_map:
+                    cdb_thread_id, cdb_frame_idx = self._frame_map[frame_id]
+                    if cdb_thread_id != self.debugger.current_thread_id:
+                        self.debugger.switch_thread(cdb_thread_id)
+                    variables = self.debugger.get_arguments(cdb_frame_idx)
+                else:
+                    variables = self.debugger.get_arguments(frame_id)
                 # For top-level variables, use their direct names
                 for var in variables:
                     var.qualified_name = var.name
@@ -826,6 +871,10 @@ class SocketDAPServer:
         # Sync thread list before signalling the stop so the client
         # sees new threads immediately rather than only those from launch.
         self._sync_threads()
+
+        # Reset frame map so IDs are unique for each new stop.
+        self._frame_map.clear()
+        self._next_frame_id = 0
 
         # Get current location for the stopped event
         try:

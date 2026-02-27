@@ -737,6 +737,11 @@ class EnhancedCdbDebugger:
         # Cache of CDB thread index -> name, populated lazily and cleared
         # whenever execution resumes so new threads get fresh names.
         self._thread_name_cache: Dict[int, str] = {}
+        # Per-stop stack cache: CDB thread index -> List[CdbFrame].
+        # Populated by prefetch_all_stacks() after each stop so that
+        # stackTrace requests for any thread are served instantly without
+        # an extra CDB round-trip.  Cleared on every resume.
+        self._stack_cache: Dict[int, List['CdbFrame']] = {}
 
     def start(self, program: str, args: List[str] = None,
               cwd: str = None) -> bool:
@@ -882,9 +887,10 @@ class EnhancedCdbDebugger:
         self.is_stopped = False
         self.was_continuing = True  # Flag to help detect breakpoint hits
         self.was_stepping = False
-        # Clear thread name cache so new/renamed threads are picked up fresh
-        # at the next stop.
+        # Clear caches so new/renamed threads are picked up fresh at the
+        # next stop, and stale stack frames are never served.
         self._thread_name_cache.clear()
+        self._stack_cache.clear()
         logger.info("Continuing execution...")
 
         # Don't use timeout for continue - let it run until breakpoint/event
@@ -965,12 +971,14 @@ class EnhancedCdbDebugger:
     def step_over(self):
         """Step over until we reach a different source line"""
         self.was_stepping = True
+        self._stack_cache.clear()
         self.communicator.send_command('p')
         # self._step_until_line_changes('pct', 'Step over')
 
     def step_into(self):
         """Step into until we reach a different source line"""
         self.was_stepping = True
+        self._stack_cache.clear()
         # stepping into will call an assembly jmp, but not
         # immediately move to the source line inside the function.
         # therefore, step into twice
@@ -981,6 +989,7 @@ class EnhancedCdbDebugger:
     def step_out(self):
         """Step out of current function"""
         self.was_stepping = True  # Track that we initiated a step
+        self._stack_cache.clear()
         self.communicator.send_command('gu')
 
     def pause(self):
@@ -1023,67 +1032,93 @@ class EnhancedCdbDebugger:
         # while the program was running.
         self._thread_name_cache.clear()
 
+        self._stack_cache.clear()
         self.is_stopped = True
         logger.info("Pause complete, debugger should be at prompt")
 
+    def prefetch_all_stacks(self) -> None:
+        """Batch-fetch every thread's stack trace in one CDB round-trip.
+
+        CDB's ``~*kn`` runs ``kn`` for all threads simultaneously and emits
+        their stacks in sequence.  Parsing the combined output and storing the
+        results in ``_stack_cache`` means that any subsequent
+        ``get_stack_trace(N)`` call returns immediately without additional CDB
+        commands — critical for DAP clients (e.g. nvim-dap) that do not
+        proactively request all thread stacks after a stop event.
+        """
+        try:
+            logger.info("Prefetching all thread stacks via ~*kn...")
+            output = self.communicator.send_command('~*kn', timeout=30.0)
+            if not output:
+                logger.warning("~*kn returned empty output")
+                return
+            self._stack_cache = self._parse_all_stacks(output)
+            logger.info(
+                f"Prefetched stacks for {len(self._stack_cache)} threads: "
+                + str({tid: len(frames)
+                       for tid, frames in self._stack_cache.items()})
+            )
+        except Exception as e:
+            logger.error(f"prefetch_all_stacks failed: {e}")
+
+    def _parse_all_stacks(
+            self, output: str) -> Dict[int, List[CdbFrame]]:
+        """Parse the combined output of ``~*kn`` into a per-thread dict."""
+        # Unwrap continuation lines that CDB wraps at ~80 columns.
+        output = re.sub(
+            r'([0-9a-fA-F`])\n\s*([0-9a-fA-F])', r'\1\2', output)
+
+        # Locate all thread-header lines so we can split by thread.
+        thread_headers = list(
+            self.parser.THREAD_PATTERN.finditer(output))
+        if not thread_headers:
+            logger.warning("_parse_all_stacks: no thread headers found")
+            return {}
+
+        cache: Dict[int, List[CdbFrame]] = {}
+        for i, m in enumerate(thread_headers):
+            thread_id = int(m.group(1))
+            # Section runs from end of this header to start of the next.
+            start = m.end()
+            end = (thread_headers[i + 1].start()
+                   if i + 1 < len(thread_headers) else len(output))
+            section = output[start:end]
+            frames = self.parser.parse_stack_trace(section)
+            cache[thread_id] = frames
+            logger.debug(
+                f"  thread {thread_id}: {len(frames)} frames cached")
+        return cache
+
     def get_stack_trace(self, thread_id: int = None) -> List[CdbFrame]:
-        """Get current stack trace"""
-        # Use 'is not None' rather than truthiness so thread 0 is handled
-        if thread_id is not None and thread_id != self.current_thread_id:
-            self.switch_thread(thread_id)
+        """Get the stack trace for *thread_id*.
 
-        # Use kn (numbered stack) for parsing,
-        # it has the frame numbers that the parser expects
-        response = self.communicator.send_command('kn')
-        logger.debug(f"Numbered stack trace response: {response}")
+        Returns frames from ``_stack_cache`` if prefetch_all_stacks() has
+        already been called for this stop (the common case).  Falls back to
+        a live ``~Nkn`` query when the cache is empty (e.g. before the first
+        prefetch, or for a thread that appeared after the prefetch ran).
+        """
+        # Determine which thread to query.
+        if thread_id is None:
+            thread_id = self.current_thread_id
 
-        # Parse the stack trace using the numbered output
+        # Serve from the prefetch cache when available.
+        if thread_id in self._stack_cache:
+            frames = self._stack_cache[thread_id]
+            logger.debug(
+                f"get_stack_trace: serving {len(frames)} cached frames "
+                f"for thread {thread_id}")
+            return frames
+
+        # Fall back to a live query.
+        cmd = f'~{thread_id}kn'
+        response = self.communicator.send_command(cmd)
+        logger.debug(f"Stack trace for thread {thread_id}: {response}")
+
         frames = self.parser.parse_stack_trace(response)
-        logger.debug(f"Parsed {len(frames)} frames from stack trace")
-
-        # The frames should already have source information from the kn command
-        # but let's verify and enhance if needed
+        logger.debug(f"Parsed {len(frames)} frames for thread {thread_id}")
         for i, frame in enumerate(frames):
-            logger.debug(f"Frame {i}: {frame.name} at "
+            logger.debug(f"  Frame {i}: {frame.name} at "
                          f"{frame.file}:{frame.line}")
-
-            # If we don't have source info for this frame, try to get it
-            if not frame.file or frame.line == 0:
-                try:
-                    # Switch to this frame and get source info
-                    frame_cmd = f'.frame {i}'
-                    self.communicator.send_command(frame_cmd)
-
-                    # Get current location for this frame
-                    frame_output = self.communicator.send_command('.frame')
-                    logger.debug(f"Frame {i} output: {frame_output}")
-
-                    # Parse for source file and line from frame output
-                    import re
-                    source_patterns = [
-                        # [filename @ line]
-                        r'\[([^@]+)\s*@\s*(\d+)\]',
-                        # (filename:line)
-                        r'\(([^)]+):(\d+)\)',
-                        # path\file.ext : line
-                        r'([a-zA-Z]:[^:\s]+\.[a-zA-Z]+)\s*:\s*(\d+)',
-                    ]
-
-                    for pattern in source_patterns:
-                        match = re.search(pattern, frame_output)
-                        if match:
-                            frame.file = match.group(1).strip()
-                            frame.line = int(match.group(2))
-                            logger.debug(f"Enhanced frame {i}: "
-                                         f"{frame.file}:{frame.line}")
-                            break
-
-                except Exception as e:
-                    logger.debug("Could not enhance source info for frame "
-                                 f"{i}: {e}")
-
-        # Reset to frame 0
-        self.communicator.send_command('.frame 0')
 
         return frames
 
@@ -1410,6 +1445,23 @@ class EnhancedCdbDebugger:
             return None
 
         logger.debug(f"Checking unsolicited output: {repr(output[:200])}")
+
+        # The CDB prompt embedded in unsolicited output encodes the active
+        # thread: "N:frame>" e.g. "1:000>".  Extract it so that
+        # current_thread_id is accurate before we build the stop event.
+        # This is critical when a breakpoint fires on a non-main thread:
+        # without this update the stop event would report the wrong thread,
+        # and get_stack_trace would skip the necessary thread switch.
+        prompt_thread_match = re.search(r'(\d+):\d+>', output)
+        if prompt_thread_match:
+            detected = int(prompt_thread_match.group(1))
+            if detected != self.current_thread_id:
+                logger.debug(
+                    f"Updating current_thread_id: "
+                    f"{self.current_thread_id} → {detected} "
+                    "(inferred from CDB prompt in unsolicited output)"
+                )
+                self.current_thread_id = detected
 
         # Check for exceptions first and track them
         if ('first chance' in output.lower()
