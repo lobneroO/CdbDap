@@ -1,4 +1,4 @@
-"""
+﻿"""
 Enhanced CDB (Console Debugger) wrapper for better integration with DAP.
 This module provides improved communication and parsing of CDB output.
 """
@@ -23,9 +23,12 @@ logging.basicConfig(
     handlers=[
         # append mode to add to existing log
         logging.FileHandler(log_file, mode='a'),
+        # Only warnings/errors to stderr â€” DEBUG writes to stderr are slow
+        # and cause noticeable pauses during high-frequency CDB interactions.
         logging.StreamHandler(sys.stderr)
     ]
 )
+logging.getLogger().handlers[1].setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Configure CDB interaction logger
@@ -117,7 +120,11 @@ class CdbOutputParser:
         r'^([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$'
     )
     THREAD_PATTERN = re.compile(
-        r'^\s*(\d+)\s+Id:\s+([0-9a-f.]+)\s+Suspend:\s+(\d+)\s+Teb:\s+([0-9a-f`]+)\s+(.*)$',  # noqa: E501
+        # CDB marks the currently-active thread with a '.' prefix:
+        #   .  0  Id: 1234.5678 Suspend: 0 Teb: ... Unfrozen
+        #      1  Id: 1234.5679 Suspend: 1 Teb: ... Unfrozen
+        # The \.? makes the dot optional so both forms are matched.
+        r'^\s*\.?\s*(\d+)\s+Id:\s+([0-9a-f.]+)\s+Suspend:\s+(\d+)\s+Teb:\s+([0-9a-f`]+)\s+(.*)$',  # noqa: E501
         re.MULTILINE)
 
     @classmethod
@@ -387,13 +394,30 @@ class CdbOutputParser:
     def parse_threads(cls, output: str) -> List[CdbThread]:
         """Parse thread list output"""
         threads = []
+
+        # CDB wraps output at ~80 columns, which can split a hex TEB address
+        # across two lines, e.g.:
+        #   .  0  Id: abac.7904 Suspend: 1 Teb: 00000065`5
+        #   9ae7000 Unfrozen
+        # Join continuation lines: wherever a hex character is immediately
+        # followed by a newline and then more hex characters, merge them.
+        output = re.sub(r'([0-9a-fA-F])\n\s*([0-9a-fA-F])', r'\1\2', output)
+
         matches = cls.THREAD_PATTERN.findall(output)
 
         for match in matches:
             thread_id, thread_name, suspend_count, teb, state = match
+            # CDB appends the thread name in double-quotes when one is set:
+            #   Unfrozen "Main Thread"
+            # Extract it if present; otherwise leave name empty so the
+            # caller can try an alternative method (e.g. dx @$curthread.Name).
+            name = ""
+            quoted = re.search(r'"([^"]+)"', state)
+            if quoted:
+                name = quoted.group(1)
             threads.append(CdbThread(
                 id=int(thread_id),
-                name=f"Thread {thread_id}",
+                name=name,
                 state=state,
                 address=teb
             ))
@@ -454,7 +478,11 @@ class CdbCommunicator:
                 text=True,
                 cwd=cwd,
                 bufsize=0,
-                universal_newlines=True
+                universal_newlines=True,
+                # CREATE_NEW_PROCESS_GROUP is required so that
+                # os.kill(pid, CTRL_BREAK_EVENT) targets only
+                # the CDB process group and not our own process.
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
             )
 
             self.is_running = True
@@ -472,6 +500,12 @@ class CdbCommunicator:
             # Send initial setup commands
             logger.info("Sending initial setup commands...")
             self.send_command(".echo Setting up debugger...")
+
+            # Prevent CDB from wrapping output lines (default is 80 cols).
+            # NOTE: .outwidth is not supported by all CDB versions; if it
+            # fails the parse_threads() method handles wrapped lines via
+            # a regex pre-processing step.
+            self.send_command('.outwidth 200')
 
             # force (re)load symbols, as Cdb does not automatically do this
             self.send_command(".reload /f")
@@ -603,9 +637,11 @@ class CdbCommunicator:
                 # If we're waiting for a command response,
                 # only check for buffer overflow
                 elif self.current_command and len(buffer) > 5000:
-                    logger.warning("Command response buffer getting "
-                                   f"very long: {len(buffer)} chars")
-                    # Don't clear the buffer, just log the warning
+                    # Log once at the 5000-char threshold, then stay silent
+                    if len(buffer) == 5001:
+                        logger.debug("Command response buffer large "
+                                     f"(>5000 chars) for '{self.current_command}'"
+                                     " â€” CDB may be emitting ModLoad output")
 
             except Exception as e:
                 logger.error(f"Error reading CDB output: {e}")
@@ -698,6 +734,9 @@ class EnhancedCdbDebugger:
         self.current_thread_id = 0
         self.is_stopped = True
         self.recent_exception = None  # Track recent exceptions
+        # Cache of CDB thread index -> name, populated lazily and cleared
+        # whenever execution resumes so new threads get fresh names.
+        self._thread_name_cache: Dict[int, str] = {}
 
     def start(self, program: str, args: List[str] = None,
               cwd: str = None) -> bool:
@@ -843,6 +882,9 @@ class EnhancedCdbDebugger:
         self.is_stopped = False
         self.was_continuing = True  # Flag to help detect breakpoint hits
         self.was_stepping = False
+        # Clear thread name cache so new/renamed threads are picked up fresh
+        # at the next stop.
+        self._thread_name_cache.clear()
         logger.info("Continuing execution...")
 
         # Don't use timeout for continue - let it run until breakpoint/event
@@ -856,20 +898,25 @@ class EnhancedCdbDebugger:
             self.was_continuing = False
 
     def get_current_location(self) -> Tuple[Optional[str], int]:
-        """Get current source file and line number"""
+        """Get current source file and line number.
+
+        Uses the full call stack ('k') and returns the first (shallowest)
+        frame that has source-file information, skipping CRT / OS frames
+        that have no [file @ line] annotation.
+        """
         try:
             logger.debug("Getting current location...")
 
-            # Get stack frame with source info - this is most reliable
-            frame_output = self.communicator.send_command("k 1")
+            # Request the full stack so we can walk past CRT-internal
+            # frames (e.g. ucrtbased!fputc_nolock) to find user code.
+            frame_output = self.communicator.send_command("k")
             logger.debug(f"Frame output: {frame_output}")
 
             import re
-            # Format: "VisionSym!main [C:\Users\...\main.cxx @ 281]"
+            # Format: "module!function [C:\path\file.ext @ 42]"
             if frame_output:
-                match = re.search(r'\[([^@]+)\s*@\s*(\d+)\]', frame_output)
-                if match:
-                    # Fix double backslashes
+                for match in re.finditer(
+                        r'\[([^@\]]+)\s*@\s*(\d+)\]', frame_output):
                     file_path = match.group(1).strip().replace('\\\\', '\\')
                     line_num = int(match.group(2))
                     logger.info("Found location via frame output: "
@@ -879,7 +926,6 @@ class EnhancedCdbDebugger:
             logger.warning("Could not determine current location "
                            "from CDB output")
             logger.debug(f"Frame output was: {repr(frame_output)}")
-            # Removed ln_output reference (undefined variable)
             return None, 0
 
         except Exception as e:
@@ -938,14 +984,52 @@ class EnhancedCdbDebugger:
         self.communicator.send_command('gu')
 
     def pause(self):
-        """Pause execution"""
-        # Send Ctrl+C to break execution
-        self.communicator.send_command('.break')
+        """Pause execution by sending CTRL_BREAK to the CDB process group.
+
+        CDB does not poll stdin while the target is running (it is waiting
+        for a Windows debug event), so writing '.break\n' to its stdin pipe
+        has no effect.  The only reliable out-of-band interrupt is a real
+        OS-level signal via GenerateConsoleCtrlEvent, which Python exposes
+        as os.kill(pid, signal.CTRL_BREAK_EVENT).
+
+        CDB must have been started with CREATE_NEW_PROCESS_GROUP so that the
+        event is delivered only to the CDB process group and not to our own
+        Python process.
+        """
+        import signal as _signal
+        logger.info("Pausing execution via CTRL_BREAK_EVENT...")
+        try:
+            os.kill(self.communicator.process.pid,
+                    _signal.CTRL_BREAK_EVENT)
+            logger.info("Sent CTRL_BREAK_EVENT to CDB process group")
+        except Exception as e:
+            logger.error(f"os.kill CTRL_BREAK_EVENT failed: {e} â€” "
+                         "falling back to .break command")
+            self.communicator.process.stdin.write('.break\n')
+            self.communicator.process.stdin.flush()
+
+        # Use send_command with a generous timeout as the settling mechanism.
+        # After CTRL_BREAK_EVENT, CDB emits all pending ModLoad messages
+        # before it issues its next prompt.  send_command absorbs all of
+        # that output naturally as part of the command response and only
+        # returns once the prompt has appeared, so subsequent commands get
+        # a clean channel.  Simultaneously this switches context to thread 0
+        # (the main/user thread) so stack queries target the right thread.
+        logger.info("Waiting for CDB to settle after break (sending ~0s)...")
+        self.communicator.send_command('~0s', timeout=15.0)
+        self.current_thread_id = 0
+
+        # Clear thread name cache â€” threads may have been created or destroyed
+        # while the program was running.
+        self._thread_name_cache.clear()
+
         self.is_stopped = True
+        logger.info("Pause complete, debugger should be at prompt")
 
     def get_stack_trace(self, thread_id: int = None) -> List[CdbFrame]:
         """Get current stack trace"""
-        if thread_id and thread_id != self.current_thread_id:
+        # Use 'is not None' rather than truthiness so thread 0 is handled
+        if thread_id is not None and thread_id != self.current_thread_id:
             self.switch_thread(thread_id)
 
         # Use kn (numbered stack) for parsing,
@@ -1092,9 +1176,59 @@ class EnhancedCdbDebugger:
         self.terminate()
 
     def get_threads(self) -> List[CdbThread]:
-        """Get thread list"""
+        """Get thread list with names where available."""
         response = self.communicator.send_command('~')
-        return self.parser.parse_threads(response)
+        threads = self.parser.parse_threads(response)
+
+        # CDB thread 0 is always the main thread (ran main()).
+        # For other threads, try dx @$curthread.Name once per thread per stop;
+        # results are cached in _thread_name_cache to avoid slow repeated
+        # round-trips on every threads request.
+        saved_thread = self.current_thread_id
+        current_cdb_thread = saved_thread
+
+        for thread in threads:
+            if thread.id == 0:
+                thread.name = "Main Thread"
+                continue
+
+            # Use cached name if available
+            if thread.id in self._thread_name_cache:
+                thread.name = self._thread_name_cache[thread.id]
+                continue
+
+            if not thread.name:
+                try:
+                    if current_cdb_thread != thread.id:
+                        self.communicator.send_command(f'~{thread.id}s')
+                        current_cdb_thread = thread.id
+                    name_out = self.communicator.send_command(
+                        'dx @$curthread.Name')
+                    # Output when name is set:
+                    #   @$curthread.Name : "WorkerThread" [Type: char *]
+                    # Output when no name is set (just the property, no value):
+                    #   @$curthread.Name
+                    m = re.search(
+                        r'@\$curthread\.Name\s*:\s*"([^"]+)"', name_out)
+                    if m:
+                        thread.name = m.group(1)
+                except Exception as e:
+                    logger.debug(f"Could not get name for thread "
+                                 f"{thread.id}: {e}")
+
+            # Fall back: use a 1-based label matching the DAP thread id
+            if not thread.name:
+                thread.name = f"Thread {thread.id + 1}"
+
+            # Cache whatever name we resolved
+            self._thread_name_cache[thread.id] = thread.name
+
+        # Restore original CDB thread context if we changed it
+        if current_cdb_thread != saved_thread:
+            self.communicator.send_command(f'~{saved_thread}s')
+        self.current_thread_id = saved_thread
+
+        return threads
 
     def switch_thread(self, thread_id: int):
         """Switch to specified thread"""
@@ -1315,7 +1449,7 @@ class EnhancedCdbDebugger:
                         return {
                             'type': 'stopped',
                             'reason': 'breakpoint',
-                            'threadId': self.current_thread_id or 1
+                            'threadId': self.current_thread_id
                         }
                     else:
                         logger.info("Breakpoint message at "
@@ -1339,7 +1473,7 @@ class EnhancedCdbDebugger:
             return {
                 'type': 'stopped',
                 'reason': 'step',
-                'threadId': self.current_thread_id or 1
+                'threadId': self.current_thread_id
             }
         elif 'Access violation' in output or 'Exception' in output:
             self.is_stopped = True
@@ -1347,7 +1481,7 @@ class EnhancedCdbDebugger:
             return {
                 'type': 'stopped',
                 'reason': 'exception',
-                'threadId': self.current_thread_id or 1
+                'threadId': self.current_thread_id
             }
         elif ('process exited' in output.lower()
                 or 'exited with code' in output.lower()):
@@ -1393,7 +1527,7 @@ class EnhancedCdbDebugger:
                             return {
                                 'type': 'stopped',
                                 'reason': 'breakpoint',
-                                'threadId': self.current_thread_id or 1
+                                'threadId': self.current_thread_id
                             }
                         else:
                             logger.info("Short prompt at "
@@ -1409,7 +1543,7 @@ class EnhancedCdbDebugger:
                     return {
                         'type': 'stopped',
                         'reason': 'breakpoint',
-                        'threadId': self.current_thread_id or 1
+                        'threadId': self.current_thread_id
                     }
 
             logger.debug("No event detected in output")
@@ -1425,7 +1559,7 @@ class EnhancedCdbDebugger:
             return {
                 'type': 'stopped',
                 'reason': 'step',
-                'threadId': self.current_thread_id or 1
+                'threadId': self.current_thread_id
             }
 
         return None

@@ -19,9 +19,12 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler(log_file, mode='w'),
+        # Only warnings/errors to stderr — DEBUG writes to stderr are slow
+        # and cause noticeable pauses during high-frequency CDB interactions.
         logging.StreamHandler(sys.stderr)
     ]
 )
+logging.getLogger().handlers[1].setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 logger.info("Socket DAP Server starting up...")
@@ -88,6 +91,12 @@ class SocketDAPServer:
 
         # Map breakpoint IDs to their source locations
         self.breakpoint_locations = {}  # bp_id -> (file_path, line)
+
+        # Thread IDs (DAP 1-based) that we have already notified the client
+        # about via 'thread started' events.  After each stop we diff against
+        # the current CDB thread list and push new entries so that neovim's
+        # thread panel stays accurate without needing a fresh 'threads' request.
+        self._known_thread_ids: set = set()
 
         # Container variable tracking for expandable variables
         # var_ref -> (container_name, container_type, size)
@@ -392,7 +401,7 @@ class SocketDAPServer:
                         break
                 stopped_event = {
                     'reason': reason,
-                    'threadId': 1,
+                    'threadId': self.debugger.current_thread_id + 1,
                     'allThreadsStopped': True
                 }
                 if file_path and line_num > 0:
@@ -402,6 +411,7 @@ class SocketDAPServer:
                     }
                     stopped_event['line'] = line_num
                     stopped_event['column'] = 1
+                self._sync_threads()
                 self.send_event('stopped', stopped_event)
             except Exception as e:
                 logger.error("Error fetching current location "
@@ -424,10 +434,13 @@ class SocketDAPServer:
         try:
             file_path, line_num = self.debugger.get_current_location()
             logger.info(f"Step completed at {file_path}:{line_num}")
+            thread_id = self.debugger.current_thread_id + 1
+
+            self._sync_threads()
 
             stopped_body = {
                 'reason': 'step',
-                'threadId': 1,  # or self.debugger.current_thread_id
+                'threadId': thread_id,
                 'allThreadsStopped': True
             }
 
@@ -447,7 +460,42 @@ class SocketDAPServer:
             # Send basic stopped event as fallback
             self.send_event('stopped', {
                 'reason': 'step',
-                'threadId': 1,
+                'threadId': self.debugger.current_thread_id + 1,
+                'allThreadsStopped': True
+            })
+
+    def _send_pause_stopped_event(self):
+        """Send stopped event after pause operation"""
+        try:
+            file_path, line_num = self.debugger.get_current_location()
+            logger.info(f"Pause completed at {file_path}:{line_num}")
+            thread_id = self.debugger.current_thread_id + 1
+
+            self._sync_threads()
+
+            stopped_body = {
+                'reason': 'pause',
+                'threadId': thread_id,
+                'allThreadsStopped': True
+            }
+
+            if file_path and line_num > 0:
+                stopped_body['source'] = {
+                    'name': os.path.basename(file_path),
+                    'path': file_path
+                }
+                stopped_body['line'] = line_num
+                stopped_body['column'] = 1
+
+            self.send_event('stopped', stopped_body)
+            logger.info(f"Sent pause stopped event for {file_path}:{line_num}")
+
+        except Exception as e:
+            logger.error(f"Error sending pause stopped event: {e}")
+            # Send basic stopped event as fallback
+            self.send_event('stopped', {
+                'reason': 'pause',
+                'threadId': self.debugger.current_thread_id + 1,
                 'allThreadsStopped': True
             })
 
@@ -502,17 +550,62 @@ class SocketDAPServer:
         try:
             self.debugger.pause()
             self.send_response(request['seq'], 'pause')
+
+            # Send stopped event — pause() already waited for CDB to settle
+            self._send_pause_stopped_event()
         except Exception as e:
             logger.error(f"Error in handle_pause: {e}")
             self.send_response(request['seq'], 'pause', False, str(e))
+
+    def _sync_threads(self):
+        """Query current CDB threads and send 'thread' events for any that the
+        client has not yet been told about.  Also send 'exited' events for
+        threads that have disappeared since the last sync.
+
+        nvim-dap does not re-issue a 'threads' request on every stop; it keeps
+        the list it received at launch.  Sending explicit 'thread started'
+        events forces it to add new threads to its panel without any polling.
+        """
+        if not self.debugger or not self.debugger.is_stopped:
+            return
+        try:
+            cdb_threads = self.debugger.get_threads()
+            current_ids = {t.id + 1 for t in cdb_threads}  # DAP 1-based
+
+            # Announce threads the client hasn't seen yet
+            for t in cdb_threads:
+                dap_id = t.id + 1
+                if dap_id not in self._known_thread_ids:
+                    self.send_event('thread', {
+                        'threadId': dap_id,
+                        'reason': 'started'
+                    })
+                    logger.info(f"Announced new thread {dap_id} "
+                                f"('{t.name}') to client")
+
+            # Announce threads that have exited
+            for old_id in list(self._known_thread_ids):
+                if old_id not in current_ids:
+                    self.send_event('thread', {
+                        'threadId': old_id,
+                        'reason': 'exited'
+                    })
+                    logger.info(f"Announced exited thread {old_id} to client")
+
+            self._known_thread_ids = current_ids
+        except Exception as e:
+            logger.warning(f"_sync_threads failed: {e}")
 
     def handle_threads(self, request: Dict[str, Any]):
         logger.info("Handling threads request")
         try:
             threads = self.debugger.get_threads()
-            thread_list = [Thread(id=t.id, name=t.name) for t in threads]
+            # CDB uses 0-based thread indices; DAP requires IDs >= 1
+            thread_list = [Thread(id=t.id + 1, name=t.name) for t in threads]
             if not thread_list:
                 thread_list = [Thread(id=1, name='Main Thread')]
+            # Update our known-thread cache so _sync_threads doesn't re-announce
+            self._known_thread_ids = {t.id for t in thread_list}
             self.send_response(request['seq'], 'threads', body={
                 'threads': [asdict(t) for t in thread_list]
             })
@@ -526,7 +619,9 @@ class SocketDAPServer:
         """Handle stackTrace request"""
         logger.info("Handling stackTrace request")
         args = request.get('arguments', {})
-        thread_id = args.get('threadId', 1)
+        dap_thread_id = args.get('threadId', 1)
+        # Convert DAP 1-based thread ID back to CDB 0-based index
+        thread_id = max(0, dap_thread_id - 1)
 
         try:
             frames = self.debugger.get_stack_trace(thread_id)
@@ -728,13 +823,18 @@ class SocketDAPServer:
 
     def _run_stopped(self, event):
         print()
+        # Sync thread list before signalling the stop so the client
+        # sees new threads immediately rather than only those from launch.
+        self._sync_threads()
+
         # Get current location for the stopped event
         try:
             file_path, line_num = \
                 self.debugger.get_current_location()
             stopped_body = {
                 'reason': event['reason'],
-                'threadId': event['threadId'],
+                # event['threadId'] is a CDB 0-based index; add 1 for DAP
+                'threadId': event['threadId'] + 1,
                 'allThreadsStopped': True
             }
 
@@ -762,7 +862,7 @@ class SocketDAPServer:
             # Send basic stopped event without location
             self.send_event('stopped', {
                 'reason': event['reason'],
-                'threadId': event['threadId'],
+                'threadId': event['threadId'] + 1,
                 'allThreadsStopped': True
             })
 
